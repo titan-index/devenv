@@ -100,7 +100,9 @@ let
 
   runSetupSchemaScript =
     if cfg.setupSchemaScript == null
-    then ""
+    then ''
+      echo "script not provided, skipping."
+    ''
     else ''
       ${cfg.setupSchemaScript}
     '';
@@ -166,11 +168,18 @@ let
     unset POSTGRES_RUN_INITIAL_SCRIPT
   '';
 
-  setupSchema = pkgs.writeShellScriptBin "setup-schema" ''
+  setupSchemaScript = pkgs.writeShellScriptBin "setup-schema-script" ''
     echo
     echo "PostgreSQL is setting up the schema"
     echo
+    OLDPGHOST="$PGHOST"
+    PGHOST=${q runtimeDir}
+
+    pg_ctl -D "$PGDATA" -w start -o "-c unix_socket_directories=${runtimeDir} -c listen_addresses= -p ${toString cfg.port}"
     ${runSetupSchemaScript}
+    pg_ctl -D "$PGDATA" -m fast -w stop
+    PGHOST="$OLDPGHOST"
+    unset OLDPGHOST
     echo
     echo "PostgreSQL setup schema complete."
     echo
@@ -180,7 +189,7 @@ let
     set -euo pipefail
     mkdir -p ${q runtimeDir}
     ${setupScript}/bin/setup-postgres
-    ${setupSchema}/bin/setup-schema
+    ${setupSchemaScript}/bin/setup-schema-script
     exec ${postgresPkg}/bin/postgres
   '';
 in
@@ -333,7 +342,6 @@ in
       '';
     };
 
-
     initialScript = lib.mkOption {
       type = types.nullOr types.str;
       default = null;
@@ -351,12 +359,14 @@ in
       type = types.nullOr types.str;
       default = null;
       description = ''
-        script to run to setup or update database schema. This script should be idempotent.
+        Path to a script that will set up or update the PostgreSQL database schema. This script must be idempotent, meaning it can be run multiple times without causing unintended side effects. 
+        If your schema changes dynamically, ensure that this script handles such cases gracefully to maintain database integrity.
       '';
       example = lib.literalExpression ''
-        sqitch deploy db:pg://localhost/db_name
+        "path/to/your/schema/setup/script.sh"
       '';
     };
+
     hbaConf = lib.mkOption {
       type = types.nullOr types.str;
       default = null;
