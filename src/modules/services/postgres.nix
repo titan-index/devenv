@@ -98,6 +98,13 @@ let
     ''
     else "";
 
+  runSetupSchemaScript =
+    if cfg.setupSchemaScript == null
+    then ""
+    else ''
+      ${cfg.setupSchemaScript}
+    '';
+
   toStr = value:
     if true == value
     then "yes"
@@ -158,10 +165,22 @@ let
     fi
     unset POSTGRES_RUN_INITIAL_SCRIPT
   '';
+
+  setupSchema = pkgs.writeShellScriptBin "setup-schema" ''
+    echo
+    echo "PostgreSQL is setting up the schema"
+    echo
+    ${runSetupSchemaScript}
+    echo
+    echo "PostgreSQL setup schema complete."
+    echo
+  '';
+
   startScript = pkgs.writeShellScriptBin "start-postgres" ''
     set -euo pipefail
     mkdir -p ${q runtimeDir}
     ${setupScript}/bin/setup-postgres
+    ${setupSchema}/bin/setup-schema
     exec ${postgresPkg}/bin/postgres
   '';
 in
@@ -314,6 +333,7 @@ in
       '';
     };
 
+
     initialScript = lib.mkOption {
       type = types.nullOr types.str;
       default = null;
@@ -327,6 +347,16 @@ in
       '';
     };
 
+    setupSchemaScript = lib.mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = ''
+        script to run to setup or update database schema. This script should be idempotent.
+      '';
+      example = lib.literalExpression ''
+        sqitch deploy db:pg://localhost/db_name
+      '';
+    };
     hbaConf = lib.mkOption {
       type = types.nullOr types.str;
       default = null;
