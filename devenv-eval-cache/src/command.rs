@@ -1,7 +1,7 @@
 use futures::future::join_all;
 use miette::Diagnostic;
 use sqlx::SqlitePool;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::sync::Arc;
@@ -91,17 +91,29 @@ impl<'a> CachedCommand<'a> {
 
         let mut child = cmd.spawn().map_err(CommandError::Io)?;
 
-        let mut stdout = child.stdout.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
+
+        let stdout_reader = BufReader::new(stdout);
+        let stderr_reader = BufReader::new(stderr);
+
+        let stdout_thread = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            let mut lines = stdout_reader.lines();
+            while let Some(Ok(line)) = lines.next() {
+                output.extend_from_slice(line.as_bytes());
+                output.push(b'\n');
+            }
+            output
+        });
 
         let on_stderr = self.on_stderr.take();
 
-        let stderr_thread = tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
+        let stderr_thread = std::thread::spawn(move || {
             let mut raw_lines: Vec<u8> = Vec::new();
             let mut ops = Vec::new();
 
-            let mut lines = reader.lines();
+            let mut lines = stderr_reader.lines();
             while let Some(Ok(line)) = lines.next() {
                 if let Some(log) = InternalLog::parse(&line).and_then(Result::ok) {
                     if let Some(ref f) = &on_stderr {
@@ -126,15 +138,9 @@ impl<'a> CachedCommand<'a> {
             (ops, raw_lines)
         });
 
-        let stdout_thread = tokio::spawn(async move {
-            let mut output = Vec::new();
-            stdout.read_to_end(&mut output).map(|_| output)
-        });
-
         let status = child.wait().map_err(CommandError::Io)?;
-
-        let stdout = stdout_thread.await.unwrap().map_err(CommandError::Io)?;
-        let (ops, stderr) = stderr_thread.await.unwrap();
+        let stdout = stdout_thread.join().unwrap();
+        let (ops, stderr) = stderr_thread.join().unwrap();
 
         if !status.success() {
             return Ok(Output {
@@ -248,17 +254,17 @@ pub enum Input {
 }
 
 impl Input {
-    pub fn content_hash(&self) -> &str {
+    pub fn content_hash(&self) -> Option<&str> {
         match self {
-            Self::File(desc) => &desc.content_hash,
-            Self::Env(desc) => &desc.content_hash,
+            Self::File(desc) => desc.content_hash.as_deref(),
+            Self::Env(desc) => desc.content_hash.as_deref(),
         }
     }
 
     pub fn compute_input_hash(inputs: &[Self]) -> String {
         inputs
             .iter()
-            .map(|input| input.content_hash())
+            .filter_map(Input::content_hash)
             .collect::<String>()
     }
 
@@ -281,7 +287,7 @@ impl Input {
 pub struct FileInputDesc {
     pub path: PathBuf,
     pub is_directory: bool,
-    pub content_hash: String,
+    pub content_hash: Option<String>,
     pub modified_at: SystemTime,
 }
 
@@ -305,9 +311,9 @@ impl FileInputDesc {
                 .filter_map(Result::ok)
                 .map(|entry| entry.path().to_string_lossy().to_string())
                 .collect::<String>();
-            hash::digest(&paths)
+            Some(hash::digest(&paths))
         } else {
-            hash::compute_file_hash(&path)?
+            hash::compute_file_hash(&path).ok()
         };
         let modified_at = path.metadata()?.modified()?;
         Ok(Self {
@@ -322,7 +328,7 @@ impl FileInputDesc {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EnvInputDesc {
     pub name: String,
-    pub content_hash: String,
+    pub content_hash: Option<String>,
 }
 
 impl Ord for EnvInputDesc {
@@ -339,8 +345,8 @@ impl PartialOrd for EnvInputDesc {
 
 impl EnvInputDesc {
     pub fn new(name: String) -> Result<Self, io::Error> {
-        let value = std::env::var(&name).unwrap_or_default();
-        let content_hash = hash::digest(&value);
+        let value = std::env::var(&name).ok();
+        let content_hash = value.map(hash::digest);
         Ok(Self { name, content_hash })
     }
 }
@@ -381,7 +387,11 @@ impl From<db::FileInputRow> for FileInputDesc {
         Self {
             path: row.path,
             is_directory: row.is_directory,
-            content_hash: row.content_hash,
+            content_hash: if row.content_hash.is_empty() {
+                None
+            } else {
+                Some(row.content_hash)
+            },
             modified_at: row.modified_at,
         }
     }
@@ -391,7 +401,11 @@ impl From<db::EnvInputRow> for EnvInputDesc {
     fn from(row: db::EnvInputRow) -> Self {
         Self {
             name: row.name,
-            content_hash: row.content_hash,
+            content_hash: if row.content_hash.is_empty() {
+                None
+            } else {
+                Some(row.content_hash)
+            },
         }
     }
 }
@@ -545,8 +559,13 @@ enum FileState {
 fn check_file_state(file: &FileInputDesc) -> io::Result<FileState> {
     let metadata = match std::fs::metadata(&file.path) {
         Ok(metadata) => metadata,
-        // Fix
-        Err(_) => return Ok(FileState::Removed),
+        Err(_) => {
+            if file.content_hash.is_some() {
+                return Ok(FileState::Removed);
+            } else {
+                return Ok(FileState::Unchanged);
+            }
+        }
     };
 
     let modified_at = metadata.modified().and_then(truncate_to_seconds)?;
@@ -570,7 +589,7 @@ fn check_file_state(file: &FileInputDesc) -> io::Result<FileState> {
         hash::compute_file_hash(&file.path)?
     };
 
-    if new_hash == file.content_hash {
+    if Some(&new_hash) == file.content_hash.as_ref() {
         // File touched but hash unchanged
         Ok(FileState::MetadataModified { modified_at })
     } else {
@@ -586,12 +605,16 @@ fn check_env_state(env: &EnvInputDesc) -> io::Result<FileState> {
     let value = std::env::var(&env.name);
 
     if let Err(std::env::VarError::NotPresent) = value {
-        return Ok(FileState::Removed);
+        if env.content_hash.is_none() {
+            return Ok(FileState::Unchanged);
+        } else {
+            return Ok(FileState::Removed);
+        }
     }
 
-    let new_hash = hash::digest(&value.unwrap_or("".into()));
+    let new_hash = hash::digest(value.unwrap_or("".into()));
 
-    if new_hash != env.content_hash {
+    if Some(&new_hash) != env.content_hash.as_ref() {
         Ok(FileState::Modified {
             new_hash,
             modified_at: SystemTime::now(),
