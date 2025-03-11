@@ -82358,6 +82358,123 @@ boolean
 
 
 
+## services.n8n.enable
+
+
+
+Whether to enable n8n.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` false `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/services/n8n.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/n8n.nix)
+
+
+
+## services.n8n.address
+
+
+
+Listen address
+
+
+
+*Type:*
+string
+
+
+
+*Default:*
+` "127.0.0.1" `
+
+
+
+*Example:*
+` "127.0.0.1" `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/services/n8n.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/n8n.nix)
+
+
+
+## services.n8n.port
+
+
+
+The TCP port to accept connections.
+
+
+
+*Type:*
+16 bit unsigned integer; between 0 and 65535 (both inclusive)
+
+
+
+*Default:*
+` 5432 `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/services/n8n.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/n8n.nix)
+
+
+
+## services.n8n.settings
+
+
+
+Configuration for n8n, see [https://docs.n8n.io/hosting/environment-variables/configuration-methods/](https://docs.n8n.io/hosting/environment-variables/configuration-methods/)
+for supported values.
+
+
+
+*Type:*
+JSON value
+
+
+
+*Default:*
+` { } `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/services/n8n.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/n8n.nix)
+
+
+
+## services.n8n.webhookUrl
+
+
+
+WEBHOOK_URL for n8n, in case we’re running behind a reverse proxy.
+This cannot be set through configuration and must reside in an environment variable.
+
+
+
+*Type:*
+string
+
+
+
+*Default:*
+` "" `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/services/n8n.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/n8n.nix)
+
+
+
 ## services.nginx.enable
 
 
@@ -82472,6 +82589,168 @@ strings concatenated with “\\n”
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/services/nginx.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/nginx.nix)
+
+
+
+## services.ollama.enable
+
+
+
+Whether to enable ollama.
+
+
+
+*Type:*
+boolean
+
+
+
+*Default:*
+` false `
+
+
+
+*Example:*
+` true `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/services/ollama.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/ollama.nix)
+
+
+
+## services.ollama.package
+
+
+
+The ollama package to use.
+
+
+
+*Type:*
+package
+
+
+
+*Default:*
+` pkgs.ollama `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/services/ollama.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/ollama.nix)
+
+
+
+## services.ollama.acceleration
+
+
+
+What interface to use for hardware acceleration.
+
+ - ` null `: default behavior
+   
+    - if ` nixpkgs.config.rocmSupport ` is enabled, uses ` "rocm" `
+    - if ` nixpkgs.config.cudaSupport ` is enabled, uses ` "cuda" `
+    - otherwise defaults to ` false `
+ - ` false `: disable GPU, only use CPU
+ - ` "rocm" `: supported by most modern AMD GPUs
+   
+    - may require overriding gpu type with ` services.ollama.rocmOverrideGfx `
+      if rocm doesn’t detect your AMD gpu
+ - ` "cuda" `: supported by most modern NVIDIA GPUs
+
+
+
+*Type:*
+null or one of false, “rocm”, “cuda”
+
+
+
+*Default:*
+` null `
+
+
+
+*Example:*
+` "rocm" `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/services/ollama.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/ollama.nix)
+
+
+
+## services.ollama.address
+
+
+
+The host address which the ollama server HTTP interface listens to.
+
+
+
+*Type:*
+string
+
+
+
+*Default:*
+` "127.0.0.1" `
+
+
+
+*Example:*
+` "[::]" `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/services/ollama.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/ollama.nix)
+
+
+
+## services.ollama.loadModels
+
+
+
+Download these models using ` ollama pull ` as soon as ` ollama.service ` has started.
+
+This creates a systemd unit ` ollama-model-loader.service `.
+
+Search for models of your choice from: https://ollama.com/library
+
+
+
+*Type:*
+list of string
+
+
+
+*Default:*
+` [ ] `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/services/ollama.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/ollama.nix)
+
+
+
+## services.ollama.port
+
+
+
+Which port the ollama server listens to.
+
+
+
+*Type:*
+16 bit unsigned integer; between 0 and 65535 (both inclusive)
+
+
+
+*Default:*
+` 11434 `
+
+
+
+*Example:*
+` 11111 `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/services/ollama.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/ollama.nix)
 
 
 
@@ -83324,6 +83603,37 @@ attribute set of (boolean or floating point number or signed integer or string)
   log_disconnections = true
   log_destination = lib.mkForce "syslog";
 }
+
+```
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/services/postgres.nix](https://github.com/cachix/devenv/blob/main/src/modules/services/postgres.nix)
+
+
+
+## services.postgres.setupSchemaScript
+
+
+
+Path to a script that will set up or update the PostgreSQL database schema. This script must be idempotent, meaning it can be run multiple times without causing unintended side effects.
+If your schema changes dynamically, ensure that this script handles such cases gracefully to maintain database integrity.
+
+
+
+*Type:*
+null or string
+
+
+
+*Default:*
+` null `
+
+
+
+*Example:*
+
+```
+"path/to/your/schema/setup/script.sh"
 
 ```
 
