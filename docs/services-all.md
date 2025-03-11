@@ -19,7 +19,9 @@
   services.minio.enable = true;
   services.mongodb.enable = true;
   services.mysql.enable = true;
+  services.n8n.enable = true;
   services.nginx.enable = true;
+  services.ollama.enable = true;
   services.opensearch.enable = true;
   services.opentelemetry-collector.enable = true;
   services.postgres.enable = true;

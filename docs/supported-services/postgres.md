@@ -434,3 +434,31 @@ attribute set of (boolean or floating point number or signed integer or string)
 }
 
 ```
+
+
+
+## services\.postgres\.setupSchemaScript
+
+
+
+Path to a script that will set up or update the PostgreSQL database schema\. This script must be idempotent, meaning it can be run multiple times without causing unintended side effects\.
+If your schema changes dynamically, ensure that this script handles such cases gracefully to maintain database integrity\.
+
+
+
+*Type:*
+null or string
+
+
+
+*Default:*
+` null `
+
+
+
+*Example:*
+
+```
+"path/to/your/schema/setup/script.sh"
+
+```
