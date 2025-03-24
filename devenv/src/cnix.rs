@@ -12,11 +12,12 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 pub struct Nix {
     pub options: Options,
-    pool: SqlitePool,
+    pool: Option<SqlitePool>,
+    database_url: String,
     // TODO: all these shouldn't be here
     config: config::Config,
     global_options: cli::GlobalOptions,
@@ -28,7 +29,7 @@ pub struct Nix {
     devenv_root: PathBuf,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Options {
     /// Run `exec` to replace the shell with the command.
     pub replace_shell: bool,
@@ -36,6 +37,8 @@ pub struct Options {
     pub bail_on_error: bool,
     /// Cache the output of the command. This is opt-in per command.
     pub cache_output: bool,
+    /// Force a refresh of the cached output.
+    pub refresh_cached_output: bool,
     /// Enable logging.
     pub logging: bool,
     /// Log the stdout of the command.
@@ -51,6 +54,7 @@ impl Default for Options {
             bail_on_error: true,
             // Individual commands opt into caching
             cache_output: false,
+            refresh_cached_output: false,
             logging: true,
             logging_stdout: false,
             nix_flags: &[
@@ -91,13 +95,11 @@ impl Nix {
             "sqlite:{}/nix-eval-cache.db",
             devenv_dotfile.to_string_lossy()
         );
-        let pool = devenv_eval_cache::db::setup_db(database_url)
-            .await
-            .into_diagnostic()?;
 
         Ok(Self {
             options,
-            pool,
+            pool: None,
+            database_url,
             config,
             global_options,
             cachix_caches,
@@ -107,6 +109,19 @@ impl Nix {
             devenv_dotfile,
             devenv_root,
         })
+    }
+
+    // Defer creating local project state
+    pub async fn assemble(&mut self) -> Result<()> {
+        if self.pool.is_none() {
+            self.pool = Some(
+                devenv_eval_cache::db::setup_db(&self.database_url)
+                    .await
+                    .into_diagnostic()?,
+            );
+        }
+
+        Ok(())
     }
 
     pub async fn develop(
@@ -131,8 +146,13 @@ impl Nix {
         json: bool,
         gc_root: &PathBuf,
     ) -> Result<devenv_eval_cache::Output> {
+        // Refresh the cache if the GC root is not a valid path.
+        // This can happen if the store path is forcefully removed: GC'd or the Nix store is
+        // tampered with.
+        let refresh_cached_output = fs::canonicalize(gc_root).is_err();
         let options = Options {
             cache_output: true,
+            refresh_cached_output,
             ..self.options
         };
         let gc_root_str = gc_root.to_str().expect("gc root should be utf-8");
@@ -144,19 +164,25 @@ impl Nix {
             .run_nix_with_substituters("nix", &args, &options)
             .await?;
 
+        // Delete any old generations of this profile.
         let options = Options {
             logging: false,
             ..self.options
         };
-
         let args: Vec<&str> = vec!["-p", gc_root_str, "--delete-generations", "old"];
         self.run_nix("nix-env", &args, &options).await?;
+
+        // Save the GC root for this profile.
         let now_ns = get_now_with_nanoseconds();
         let target = format!("{}-shell", now_ns);
-        symlink_force(
-            &fs::canonicalize(gc_root).expect("to resolve gc_root"),
-            &self.devenv_home_gc.join(target),
-        );
+        if let Ok(resolved_gc_root) = fs::canonicalize(gc_root) {
+            symlink_force(&resolved_gc_root, &self.devenv_home_gc.join(target));
+        } else {
+            warn!(
+                "Failed to resolve the GC root path to the Nix store: {}. Try running devenv again with --refresh-eval-cache.",
+                gc_root.display()
+            );
+        }
 
         Ok(env)
     }
@@ -332,6 +358,7 @@ impl Nix {
         self.run_nix_command(cmd, options).await
     }
 
+    #[instrument(skip(self), fields(output, cache_status))]
     async fn run_nix_command(
         &self,
         mut cmd: std::process::Command,
@@ -346,6 +373,11 @@ impl Nix {
             {
                 cmd.arg("--debugger");
             }
+
+            if self.global_options.verbose {
+                debug!("Running command: {}", display_command(&cmd));
+            }
+
             let error = cmd.exec();
             error!(
                 "Failed to replace shell with `{}`: {error}",
@@ -362,11 +394,17 @@ impl Nix {
             }
         }
 
+        if self.global_options.verbose {
+            debug!("Running command: {}", display_command(&cmd));
+        }
+
         let result = if self.global_options.eval_cache
             && options.cache_output
             && supports_eval_caching(&cmd)
+            && self.pool.is_some()
         {
-            let mut cached_cmd = CachedCommand::new(&self.pool);
+            let pool = self.pool.as_ref().unwrap();
+            let mut cached_cmd = CachedCommand::new(pool);
 
             cached_cmd.watch_path(self.devenv_root.join("devenv.yaml"));
             cached_cmd.watch_path(self.devenv_root.join("devenv.lock"));
@@ -374,7 +412,7 @@ impl Nix {
             // Ignore anything in .devenv.
             cached_cmd.unwatch_path(&self.devenv_dotfile);
 
-            if self.global_options.refresh_eval_cache {
+            if self.global_options.refresh_eval_cache || options.refresh_cached_output {
                 cached_cmd.force_refresh();
             }
 
@@ -404,11 +442,20 @@ impl Nix {
                 });
             }
 
-            cached_cmd
+            let output = cached_cmd
                 .output(&mut cmd)
                 .await
                 .into_diagnostic()
-                .wrap_err_with(|| format!("Failed to run command `{}`", display_command(&cmd)))?
+                .wrap_err_with(|| format!("Failed to run command `{}`", display_command(&cmd)))?;
+
+            if output.cache_hit {
+                tracing::Span::current().record(
+                    "cache_status",
+                    if output.cache_hit { "hit" } else { "miss" },
+                );
+            }
+
+            output
         } else {
             let output = cmd
                 .output()
@@ -420,8 +467,11 @@ impl Nix {
                 stdout: output.stdout,
                 stderr: output.stderr,
                 inputs: vec![],
+                cache_hit: false,
             }
         };
+
+        tracing::Span::current().record("output", format!("{:?}", result));
 
         if !result.status.success() {
             let code = match result.status.code() {
@@ -600,9 +650,6 @@ impl Nix {
         cmd.args(flags);
         cmd.current_dir(&self.devenv_root);
 
-        if self.global_options.verbose {
-            debug!("Running command: {}", display_command(&cmd));
-        }
         Ok(cmd)
     }
 

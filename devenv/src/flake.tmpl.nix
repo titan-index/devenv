@@ -60,7 +60,7 @@
               then devenvdefaultpath
               else throw (devenvdefaultpath + " file does not exist for input ${name}.");
           project = pkgs.lib.evalModules {
-            specialArgs = inputs // { inherit inputs pkgs; };
+            specialArgs = inputs // { inherit inputs; bootstrapPkgs = pkgs; };
             modules = [
               (inputs.devenv.modules + /top-level.nix)
               {
@@ -122,16 +122,18 @@
                   } else { }
               )
               options;
+
+          systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
         in
         {
-          packages."${system}" = {
+          devShell = lib.genAttrs systems (system: config.shell);
+          packages = lib.genAttrs systems (system: {
             optionsJSON = options.optionsJSON;
             # deprecated
             inherit (config) info procfileScript procfileEnv procfile;
             ci = config.ciDerivation;
-          };
+          });
           devenv = config;
           build = build project.options project.config;
-          devShell."${system}" = config.shell;
         };
       }

@@ -107,7 +107,6 @@ impl Devenv {
             .expect("Failed to create DEVENV_HOME directory");
         std::fs::create_dir_all(&devenv_home_gc)
             .expect("Failed to create DEVENV_HOME_GC directory");
-        std::fs::create_dir_all(&devenv_dot_gc).expect("Failed to create .devenv/gc directory");
 
         let nix = cnix::Nix::new(
             options.config.clone(),
@@ -119,7 +118,7 @@ impl Devenv {
             devenv_root.clone(),
         )
         .await
-        .unwrap(); // TODO: handle error
+        .expect("Failed to initialize Nix");
 
         Self {
             config: options.config,
@@ -175,16 +174,14 @@ impl Devenv {
                         file.write_all(path.contents())
                     })
                     .expect("Failed to append to existing file");
-            } else {
-                if target_path.exists() && !EXISTING_REQUIRED_FILES.contains(&filename) {
-                    if let Some(utf8_contents) = path.contents_utf8() {
-                        confirm_overwrite(&target_path, utf8_contents.to_string())?;
-                    } else {
-                        bail!("Failed to read file contents as UTF-8");
-                    }
+            } else if target_path.exists() && !EXISTING_REQUIRED_FILES.contains(&filename) {
+                if let Some(utf8_contents) = path.contents_utf8() {
+                    confirm_overwrite(&target_path, utf8_contents.to_string())?;
                 } else {
-                    std::fs::write(&target_path, path.contents()).expect("Failed to write file");
+                    bail!("Failed to read file contents as UTF-8");
                 }
+            } else {
+                std::fs::write(&target_path, path.contents()).expect("Failed to write file");
             }
         }
 
@@ -229,7 +226,11 @@ impl Devenv {
             .map(|s| s.as_str())
             .collect::<Vec<&str>>();
 
-        self.nix.develop(&develop_args, replace_shell).await?;
+        let span = info_span!("Entering shell", devenv.user_message = "Entering shell");
+        self.nix
+            .develop(&develop_args, replace_shell)
+            .instrument(span)
+            .await?;
         Ok(())
     }
 
@@ -238,7 +239,7 @@ impl Devenv {
         cmd: &Option<String>,
         args: &[String],
     ) -> Result<Vec<String>> {
-        self.assemble(false)?;
+        self.assemble(false).await?;
         let env = self.get_dev_environment(false).await?;
 
         let mut develop_args = vec![
@@ -270,23 +271,18 @@ impl Devenv {
             develop_args.push("--noprofile")
         }
 
-        match cmd {
-            Some(cmd) => {
-                develop_args.push("-c");
-                develop_args.push(cmd);
-                let args = args.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
-                develop_args.extend_from_slice(&args);
-            }
-            None => {
-                info!("Entering shell");
-            }
-        };
+        if let Some(cmd) = cmd {
+            develop_args.push("-c");
+            develop_args.push(cmd);
+            let args = args.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
+            develop_args.extend_from_slice(&args);
+        }
 
         Ok(develop_args.into_iter().map(|s| s.to_string()).collect())
     }
 
     pub async fn update(&mut self, input_name: &Option<String>) -> Result<()> {
-        self.assemble(false)?;
+        self.assemble(false).await?;
 
         let msg = match input_name {
             Some(input_name) => format!("Updating devenv.lock with input {input_name}"),
@@ -310,7 +306,7 @@ impl Devenv {
         );
 
         async move {
-            self.assemble(false)?;
+            self.assemble(false).await?;
 
             let container_store_path = self
                 .nix
@@ -410,8 +406,8 @@ impl Devenv {
         .await
     }
 
-    pub fn repl(&mut self) -> Result<()> {
-        self.assemble(false)?;
+    pub async fn repl(&mut self) -> Result<()> {
+        self.assemble(false).await?;
         self.nix.repl()
     }
 
@@ -460,7 +456,7 @@ impl Devenv {
     }
 
     pub async fn search(&mut self, name: &str) -> Result<()> {
-        self.assemble(false)?;
+        self.assemble(false).await?;
 
         let build_options = cnix::Options {
             logging: false,
@@ -531,7 +527,7 @@ impl Devenv {
     }
 
     pub async fn tasks_run(&mut self, roots: Vec<String>) -> Result<()> {
-        self.assemble(false)?;
+        self.assemble(false).await?;
         if roots.is_empty() {
             bail!("No tasks specified.");
         }
@@ -569,7 +565,7 @@ impl Devenv {
     }
 
     pub async fn test(&mut self) -> Result<()> {
-        self.assemble(true)?;
+        self.assemble(true).await?;
 
         // collect tests
         let test_script = {
@@ -617,14 +613,14 @@ impl Devenv {
     }
 
     pub async fn info(&mut self) -> Result<()> {
-        self.assemble(false)?;
+        self.assemble(false).await?;
         let output = self.nix.metadata().await?;
         println!("{}", output);
         Ok(())
     }
 
     pub async fn build(&mut self, attributes: &[String]) -> Result<()> {
-        self.assemble(false)?;
+        self.assemble(false).await?;
         let attributes: Vec<String> = if attributes.is_empty() {
             // construct dotted names of all attributes that we need to build
             let build_output = self.nix.eval(&["build"]).await?;
@@ -671,7 +667,7 @@ impl Devenv {
         detach: &bool,
         log_to_file: &bool,
     ) -> Result<()> {
-        self.assemble(false)?;
+        self.assemble(false).await?;
         if !self.has_processes().await? {
             error!("No 'processes' option defined: https://devenv.sh/processes/");
             bail!("No processes defined");
@@ -721,6 +717,7 @@ impl Devenv {
                 .prepare_develop_args(&Some(processes_script.to_str().unwrap().to_string()), &[])
                 .await?;
 
+            let span = info_span!("Entering shell");
             let mut cmd = self
                 .nix
                 .prepare_command_with_substituters(
@@ -731,6 +728,7 @@ impl Devenv {
                         .collect::<Vec<&str>>(),
                     &self.nix.options,
                 )
+                .instrument(span)
                 .await?;
 
             if *detach {
@@ -791,7 +789,7 @@ impl Devenv {
         Ok(())
     }
 
-    pub fn assemble(&mut self, is_testing: bool) -> Result<()> {
+    pub async fn assemble(&mut self, is_testing: bool) -> Result<()> {
         if self.assembled {
             return Ok(());
         }
@@ -803,8 +801,12 @@ impl Devenv {
                 $ devenv init
             "});
         }
+
         fs::create_dir_all(&self.devenv_dot_gc)
             .unwrap_or_else(|_| panic!("Failed to create {}", self.devenv_dot_gc.display()));
+
+        // Initialise any Nix state
+        self.nix.assemble().await?;
 
         let mut flake_inputs = HashMap::new();
         for (input, attrs) in self.config.inputs.iter() {
@@ -878,7 +880,7 @@ impl Devenv {
     }
 
     pub async fn get_dev_environment(&mut self, json: bool) -> Result<DevEnv> {
-        self.assemble(false)?;
+        self.assemble(false).await?;
 
         let gc_root = self.devenv_dot_gc.join("shell");
         let span = tracing::info_span!("building_shell", devenv.user_message = "Building shell",);

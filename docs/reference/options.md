@@ -602,6 +602,29 @@ string
 
 
 
+## apple.sdk
+
+
+
+The Apple SDK to add to the developer environment on macOS.
+
+If set to ` null `, the system SDK can be used if the shell allows access to external environment variables.
+
+
+
+*Type:*
+null or package
+
+
+
+*Default:*
+` if pkgs.stdenv.isDarwin then pkgs.apple-sdk else null `
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/top-level.nix](https://github.com/cachix/devenv/blob/main/src/modules/top-level.nix)
+
+
+
 ## aws-vault.enable
 
 
@@ -2299,8 +2322,6 @@ list of (one of “commit-msg”, “post-checkout”, “post-commit”, “pos
 
 ## git-hooks.excludes
 
-
-
 Exclude files that were matched by these patterns.
 
 
@@ -2319,6 +2340,8 @@ list of string
 
 
 ## git-hooks.gitPackage
+
+
 
 The ` git ` package to use.
 
@@ -5136,8 +5159,6 @@ boolean
 
 ## git-hooks.hooks.autoflake.settings.binPath
 
-
-
 Path to autoflake binary.
 
 
@@ -5160,6 +5181,8 @@ null or string
 
 
 ## git-hooks.hooks.autoflake.settings.flags
+
+
 
 Flags passed to autoflake.
 
@@ -7009,8 +7032,6 @@ null or package
 
 ## git-hooks.hooks.clippy.packageOverrides.cargo
 
-
-
 The cargo package to use
 
 
@@ -7024,6 +7045,8 @@ package
 
 
 ## git-hooks.hooks.clippy.packageOverrides.clippy
+
+
 
 The clippy package to use
 
@@ -42439,6 +42462,42 @@ outputOf (attribute set)
 
 *Declared by:*
  - [https://github.com/cachix/devenv/blob/main/src/modules/outputs.nix](https://github.com/cachix/devenv/blob/main/src/modules/outputs.nix)
+
+
+
+## overlays
+
+
+
+List of overlays to apply to pkgs. Each overlay is a function that takes two arguments: final and prev. Supported by devenv 1.4.2 or newer.
+
+
+
+*Type:*
+list of function that evaluates to a(n) function that evaluates to a(n) (attribute set)
+
+
+
+*Default:*
+` [ ] `
+
+
+
+*Example:*
+
+```
+[
+  (final: prev: {
+    hello = prev.hello.overrideAttrs (oldAttrs: {
+      patches = (oldAttrs.patches or []) ++ [ ./hello-fix.patch ];
+    });
+  })
+]
+
+```
+
+*Declared by:*
+ - [https://github.com/cachix/devenv/blob/main/src/modules/top-level.nix](https://github.com/cachix/devenv/blob/main/src/modules/top-level.nix)
 
 
 
