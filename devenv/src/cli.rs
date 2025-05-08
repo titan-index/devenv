@@ -1,5 +1,6 @@
 use crate::log::LogFormat;
 use clap::{crate_version, Parser, Subcommand};
+use devenv_tasks::RunMode;
 use std::path::PathBuf;
 use tracing::error;
 
@@ -85,15 +86,24 @@ pub struct GlobalOptions {
     )]
     pub impure: bool,
 
-    #[arg(long, global = true, help = "Cache the results of Nix evaluation.")]
     #[arg(
-        long_help = "Cache the results of Nix evaluation. Use --no-eval-cache to disable caching."
+        long,
+        global = true,
+        help = "Cache the results of Nix evaluation.",
+        hide = true
+    )]
+    #[arg(
+        long_help = "Cache the results of Nix evaluation (deprecated, on by default). Use --no-eval-cache to disable caching."
     )]
     #[arg(default_value_t = true, overrides_with = "no_eval_cache")]
     pub eval_cache: bool,
 
     /// Disable the evaluation cache. Sets `eval_cache` to false.
-    #[arg(long, global = true, hide = true)]
+    #[arg(
+        long,
+        global = true,
+        help = "Disable caching of Nix evaluation results."
+    )]
     #[arg(overrides_with = "eval_cache")]
     pub no_eval_cache: bool,
 
@@ -130,8 +140,10 @@ pub struct GlobalOptions {
         long,
         global = true,
         num_args = 2,
+        value_names = ["NAME", "VALUE"],
         value_delimiter = ' ',
-        help = "Pass additional options to nix commands, see `man nix.conf` for full list."
+        help = "Pass additional options to nix commands",
+        long_help = "Pass additional options to nix commands.\n\nThese options are passed directly to Nix using the --option flag.\nSee `man nix.conf` for the full list of available options.\n\nExamples:\n  --nix-option sandbox false\n  --nix-option keep-outputs true\n  --nix-option system x86_64-darwin"
     )]
     pub nix_option: Vec<String>,
 
@@ -140,10 +152,23 @@ pub struct GlobalOptions {
         long,
         global = true,
         num_args = 2,
+        value_names = ["NAME", "URI"],
         value_delimiter = ' ',
-        help = "Override inputs in devenv.yaml."
+        help = "Override inputs in devenv.yaml",
+        long_help = "Override inputs in devenv.yaml.\n\nExamples:\n  --override-input nixpkgs github:NixOS/nixpkgs/nixos-unstable\n  --override-input nixpkgs path:/path/to/local/nixpkgs"
     )]
     pub override_input: Vec<String>,
+
+    #[arg(
+        long,
+        short = 'O',
+        global = true,
+        num_args = 2,
+        value_names = ["OPTION", "VALUE"],
+        help = "Override configuration options with typed values",
+        long_help = "Override configuration options with typed values.\n\nOPTION must include a type: <attribute>:<type>\nSupported types: string, int, float, bool, path, pkgs\n\nExamples:\n  --option languages.rust.channel:string beta\n  --option services.postgres.enable:bool true\n  --option languages.python.version:string 3.10\n  --option packages:pkgs \"ncdu git\""
+    )]
+    pub option: Vec<String>,
 }
 
 impl Default for GlobalOptions {
@@ -165,6 +190,7 @@ impl Default for GlobalOptions {
             nix_debugger: false,
             nix_option: vec![],
             override_input: vec![],
+            option: vec![],
         }
     }
 }
@@ -207,6 +233,7 @@ pub enum Commands {
     #[command(about = "Activate the developer environment. https://devenv.sh/basics/")]
     Shell {
         cmd: Option<String>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
 
@@ -226,8 +253,8 @@ pub enum Commands {
 
     #[command(about = "Start processes in the foreground. https://devenv.sh/processes/")]
     Up {
-        #[arg(help = "Start a specific process.")]
-        process: Option<String>,
+        #[arg(help = "Start a specific process(es).")]
+        processes: Vec<String>,
 
         #[arg(short, long, help = "Start processes in the background.")]
         detach: bool,
@@ -317,7 +344,7 @@ pub enum Commands {
 pub enum ProcessesCommand {
     #[command(alias = "start", about = "Start processes in the foreground.")]
     Up {
-        process: Option<String>,
+        processes: Vec<String>,
 
         #[arg(short, long, help = "Start processes in the background.")]
         detach: bool,
@@ -332,7 +359,18 @@ pub enum ProcessesCommand {
 #[clap(about = "Run tasks. https://devenv.sh/tasks/")]
 pub enum TasksCommand {
     #[command(about = "Run tasks.")]
-    Run { tasks: Vec<String> },
+    Run {
+        tasks: Vec<String>,
+
+        #[arg(
+            short,
+            long,
+            help = "The execution mode for tasks (affects dependency resolution)",
+            value_enum,
+            default_value_t = RunMode::Single
+        )]
+        mode: RunMode,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -393,7 +431,7 @@ pub fn default_system() -> String {
 fn max_jobs() -> u8 {
     let num_cpus = std::thread::available_parallelism().unwrap_or_else(|e| {
         error!("Failed to get number of logical CPUs: {}", e);
-        std::num::NonZeroUsize::new(4).unwrap()
+        std::num::NonZeroUsize::new(4).expect("4 is non-zero")
     });
     std::cmp::max(num_cpus.get().div_ceil(2), 2) as u8
 }

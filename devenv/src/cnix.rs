@@ -4,7 +4,7 @@ use nix_conf_parser::NixConf;
 use serde::Deserialize;
 use sqlx::SqlitePool;
 use std::cell::{Ref, RefCell};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::os::unix::fs::symlink;
@@ -12,7 +12,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, debug_span, error, info, instrument, warn, Instrument};
 
 pub struct Nix {
     pub options: Options,
@@ -114,31 +114,18 @@ impl Nix {
     // Defer creating local project state
     pub async fn assemble(&mut self) -> Result<()> {
         if self.pool.is_none() {
-            self.pool = Some(
-                devenv_eval_cache::db::setup_db(&self.database_url)
-                    .await
-                    .into_diagnostic()?,
-            );
+            // Extract database path from URL
+            let path = PathBuf::from(self.database_url.trim_start_matches("sqlite:"));
+
+            // Connect to database and run migrations in one step
+            let db = devenv_cache_core::db::Database::new(path, &devenv_eval_cache::db::MIGRATIONS)
+                .await
+                .into_diagnostic()?;
+
+            self.pool = Some(db.pool().clone());
         }
 
         Ok(())
-    }
-
-    pub async fn develop(
-        &self,
-        args: &[&str],
-        replace_shell: bool,
-    ) -> Result<devenv_eval_cache::Output> {
-        let options = Options {
-            logging_stdout: true,
-            // Cannot cache this because we don't get the derivation back.
-            // We'd need to switch to print-dev-env and our own `nix develop`.
-            cache_output: false,
-            bail_on_error: false,
-            replace_shell,
-            ..self.options
-        };
-        self.run_nix_with_substituters("nix", args, &options).await
     }
 
     pub async fn dev_env(
@@ -176,7 +163,7 @@ impl Nix {
         let now_ns = get_now_with_nanoseconds();
         let target = format!("{}-shell", now_ns);
         if let Ok(resolved_gc_root) = fs::canonicalize(gc_root) {
-            symlink_force(&resolved_gc_root, &self.devenv_home_gc.join(target));
+            symlink_force(&resolved_gc_root, &self.devenv_home_gc.join(target))?;
         } else {
             warn!(
                 "Failed to resolve the GC root path to the Nix store: {}. Try running devenv again with --refresh-eval-cache.",
@@ -202,7 +189,7 @@ impl Nix {
         let link_path = self
             .devenv_dot_gc
             .join(format!("{}-{}", name, get_now_with_nanoseconds()));
-        symlink_force(path, &link_path);
+        symlink_force(path, &link_path)?;
         Ok(())
     }
 
@@ -231,6 +218,7 @@ impl Nix {
             "build".to_string(),
             "--no-link".to_string(),
             "--print-out-paths".to_string(),
+            "-L".to_string(),
         ];
         args.extend(attributes.iter().map(|attr| format!(".#{}", attr)));
         let args_str: Vec<&str> = args.iter().map(AsRef::as_ref).collect();
@@ -374,9 +362,7 @@ impl Nix {
                 cmd.arg("--debugger");
             }
 
-            if self.global_options.verbose {
-                debug!("Running command: {}", display_command(&cmd));
-            }
+            debug!("Running command: {}", display_command(&cmd));
 
             let error = cmd.exec();
             error!(
@@ -394,10 +380,6 @@ impl Nix {
             }
         }
 
-        if self.global_options.verbose {
-            debug!("Running command: {}", display_command(&cmd));
-        }
-
         let result = if self.global_options.eval_cache
             && options.cache_output
             && supports_eval_caching(&cmd)
@@ -408,8 +390,10 @@ impl Nix {
 
             cached_cmd.watch_path(self.devenv_root.join("devenv.yaml"));
             cached_cmd.watch_path(self.devenv_root.join("devenv.lock"));
+            cached_cmd.watch_path(self.devenv_dotfile.join("flake.json"));
+            cached_cmd.watch_path(self.devenv_dotfile.join("cli-options.nix"));
 
-            // Ignore anything in .devenv.
+            // Ignore anything in .devenv except for the specifically watched files above.
             cached_cmd.unwatch_path(&self.devenv_dotfile);
 
             if self.global_options.refresh_eval_cache || options.refresh_cached_output {
@@ -442,8 +426,15 @@ impl Nix {
                 });
             }
 
+            let pretty_cmd = display_command(&cmd);
+            let span = debug_span!(
+                "Running command",
+                command = pretty_cmd.as_str(),
+                devenv.user_message = format!("Running command: {}", pretty_cmd)
+            );
             let output = cached_cmd
                 .output(&mut cmd)
+                .instrument(span)
                 .await
                 .into_diagnostic()
                 .wrap_err_with(|| format!("Failed to run command `{}`", display_command(&cmd)))?;
@@ -457,10 +448,17 @@ impl Nix {
 
             output
         } else {
-            let output = cmd
-                .output()
-                .into_diagnostic()
-                .wrap_err_with(|| format!("Failed to run command `{}`", display_command(&cmd)))?;
+            let pretty_cmd = display_command(&cmd);
+            let span = debug_span!(
+                "Running command",
+                command = pretty_cmd.as_str(),
+                devenv.user_message = format!("Running command: {}", pretty_cmd)
+            );
+            let output = span.in_scope(|| {
+                cmd.output()
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("Failed to run command `{}`", display_command(&cmd)))
+            })?;
 
             devenv_eval_cache::Output {
                 status: output.status,
@@ -623,8 +621,8 @@ impl Nix {
             Ok(devenv_nix) => std::process::Command::new(format!("{devenv_nix}/bin/{command}")),
             Err(_) => {
                 error!(
-            "$DEVENV_NIX is not set, but required as devenv doesn't work without a few Nix patches."
-            );
+                    "$DEVENV_NIX is not set, but required as devenv doesn't work without a few Nix patches."
+                );
                 error!("Please follow https://devenv.sh/getting-started/ to install devenv.");
                 bail!("$DEVENV_NIX is not set")
             }
@@ -690,8 +688,11 @@ impl Nix {
                 known_keys,
             };
 
-            let mut new_known_keys: HashMap<String, String> = HashMap::new();
-            let client = reqwest::Client::new();
+            let client = reqwest::Client::builder()
+                .use_preconfigured_tls(http_client_tls::tls_config())
+                .build()
+                .expect("Failed to create reqwest client");
+            let mut new_known_keys: BTreeMap<String, String> = BTreeMap::new();
             for name in caches.caches.pull.iter() {
                 if !caches.known_keys.contains_key(name) {
                     let mut request =
@@ -702,11 +703,13 @@ impl Nix {
                     let resp = request.send().await.expect("Failed to get cache");
                     if resp.status().is_client_error() {
                         error!(
-                        "Cache {} does not exist or you don't have a CACHIX_AUTH_TOKEN configured.",
-                        name
-                    );
+                            "Cache {} does not exist or you don't have a CACHIX_AUTH_TOKEN configured.",
+                            name
+                        );
                         error!("To create a cache, go to https://app.cachix.org/.");
-                        bail!("Cache does not exist or you don't have a CACHIX_AUTH_TOKEN configured.")
+                        bail!(
+                            "Cache does not exist or you don't have a CACHIX_AUTH_TOKEN configured."
+                        )
                     } else {
                         let resp_json =
                             serde_json::from_slice::<CachixResponse>(&resp.bytes().await.unwrap())
@@ -726,8 +729,8 @@ impl Nix {
                     .trusted;
                 if trusted.is_none() {
                     warn!(
-                    "You're using an outdated version of Nix. Please upgrade and restart the nix-daemon.",
-                );
+                        "You're using an outdated version of Nix. Please upgrade and restart the nix-daemon.",
+                    );
                 }
                 let restart_command = if cfg!(target_os = "linux") {
                     "sudo systemctl restart nix-daemon"
@@ -861,7 +864,7 @@ impl Nix {
     }
 }
 
-fn symlink_force(link_path: &Path, target: &Path) {
+fn symlink_force(link_path: &Path, target: &Path) -> Result<()> {
     let _lock = dotlock::Dotlock::create(target.with_extension("lock")).unwrap();
 
     debug!(
@@ -871,16 +874,20 @@ fn symlink_force(link_path: &Path, target: &Path) {
     );
 
     if target.exists() {
-        fs::remove_file(target).unwrap_or_else(|_| panic!("Failed to remove {}", target.display()));
+        fs::remove_file(target)
+            .map_err(|e| miette::miette!("Failed to remove {}: {}", target.display(), e))?;
     }
 
-    symlink(link_path, target).unwrap_or_else(|_| {
-        panic!(
-            "Failed to create symlink: {} -> {}",
+    symlink(link_path, target).map_err(|e| {
+        miette::miette!(
+            "Failed to create symlink: {} -> {}: {}",
             link_path.display(),
-            target.display()
+            target.display(),
+            e
         )
-    });
+    })?;
+
+    Ok(())
 }
 
 fn get_now_with_nanoseconds() -> String {
@@ -919,7 +926,7 @@ pub struct Cachix {
 #[derive(Deserialize, Default, Clone)]
 pub struct CachixCaches {
     caches: Cachix,
-    known_keys: HashMap<String, String>,
+    known_keys: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize, Clone)]

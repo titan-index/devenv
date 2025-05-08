@@ -11,18 +11,20 @@ This feature relies on a separate tool called [direnv](https://direnv.net) (not 
 
 To enable automatic shell activation, create an `.envrc` file in your project directory with the following content:
 
-=== "v1.3 and older"
-
-    ``` bash title=".envrc"
-    source_url "https://raw.githubusercontent.com/cachix/devenv/82c0147677e510b247d8b9165c54f73d32dfd899/direnvrc" "sha256-7u4iDd1nZpxL4tCzmPG0dQgC5V+/44Ba+tHkPob1v2k="
-
-    use devenv
-    ```
-
 === "v1.4+"
 
     ``` bash title=".envrc"
     eval "$(devenv direnvrc)"
+
+    # You can pass flags to the devenv command
+    # For example: use devenv --impure --option services.postgres.enable:bool true
+    use devenv
+    ```
+
+=== "v1.3 and older"
+
+    ``` bash title=".envrc"
+    source_url "https://raw.githubusercontent.com/cachix/devenv/82c0147677e510b247d8b9165c54f73d32dfd899/direnvrc" "sha256-7u4iDd1nZpxL4tCzmPG0dQgC5V+/44Ba+tHkPob1v2k="
 
     use devenv
     ```
@@ -50,6 +52,15 @@ Building shell ...
 Entering shell ...
 
 (devenv) $
+```
+
+## Passing flags to devenv
+
+You can pass command-line options directly to devenv by adding them after the `use devenv` command in your `.envrc` file:
+
+```bash
+# Example: override configuration options
+use devenv --option services.postgres.enable:bool true
 ```
 
 ## Customizing PS1

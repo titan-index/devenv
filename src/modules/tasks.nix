@@ -1,10 +1,10 @@
 { pkgs, lib, config, ... }@inputs:
 let
   types = lib.types;
-  devenv = pkgs.callPackage ./../../package.nix {
+  devenv-tasks = pkgs.callPackage ./../../package.nix {
     build_tasks = true;
+    cachix = null;
     inherit (inputs.nix.packages.${pkgs.stdenv.system}) nix;
-    inherit (inputs.cachix.packages.${pkgs.stdenv.system}) cachix;
   };
   taskType = types.submodule
     ({ name, config, ... }:
@@ -23,7 +23,7 @@ let
               #!${binary}
               ${lib.optionalString (!isStatus) "set -e"}
               ${command}
-              ${lib.optionalString (config.exports != [] && !isStatus) "${devenv}/bin/devenv-tasks export ${lib.concatStringsSep " " config.exports}"}
+              ${lib.optionalString (config.exports != [] && !isStatus) "${inputs.config.task.package}/bin/devenv-tasks export ${lib.concatStringsSep " " config.exports}"}
             '';
       in
       {
@@ -61,6 +61,11 @@ let
             default = mkCommand config.status true;
             description = "Path to the script to run.";
           };
+          execIfModified = lib.mkOption {
+            type = types.listOf types.str;
+            default = [ ];
+            description = "Paths to files that should trigger a task execution if modified.";
+          };
           config = lib.mkOption {
             type = types.attrsOf types.anything;
             internal = true;
@@ -72,6 +77,7 @@ let
               before = config.before;
               command = config.command;
               input = config.input;
+              exec_if_modified = config.execIfModified;
             };
             description = "Internal configuration for the task.";
           };
@@ -116,6 +122,11 @@ in
       internal = true;
       description = "The generated tasks.json file.";
     };
+    task.package = lib.mkOption {
+      type = config.lib.types.output;
+      internal = true;
+      default = lib.getBin devenv-tasks;
+    };
   };
 
   config = {
@@ -125,6 +136,10 @@ in
       {
         assertion = lib.all (task: task.package.meta.mainProgram == "bash" || task.binary == "bash" || task.exports == [ ]) (lib.attrValues config.tasks);
         message = "The 'exports' option for a task can only be set when 'package' is a bash package.";
+      }
+      {
+        assertion = lib.all (task: task.status == null || task.execIfModified == [ ]) (lib.attrValues config.tasks);
+        message = "The 'status' and 'execIfModified' options cannot be used together. Use only one of them to determine whether a task should run.";
       }
     ];
 
@@ -139,7 +154,7 @@ in
       "devenv:enterShell" = {
         description = "Runs when entering the shell";
         exec = ''
-          mkdir -p "$DEVENV_DOTFILE"
+          mkdir -p "$DEVENV_DOTFILE" || { echo "Failed to create $DEVENV_DOTFILE"; exit 1; }
           echo "$DEVENV_TASK_ENV" > "$DEVENV_DOTFILE/load-exports"
           chmod +x "$DEVENV_DOTFILE/load-exports"
         '';
@@ -149,13 +164,13 @@ in
       };
     };
     enterShell = ''
-      ${devenv}/bin/devenv-tasks run devenv:enterShell
+      ${config.task.package}/bin/devenv-tasks run devenv:enterShell --mode all
       if [ -f "$DEVENV_DOTFILE/load-exports" ]; then
         source "$DEVENV_DOTFILE/load-exports"
       fi
     '';
     enterTest = ''
-      ${devenv}/bin/devenv-tasks run devenv:enterTest
+      ${config.task.package}/bin/devenv-tasks run devenv:enterTest --mode all
     '';
   };
 }

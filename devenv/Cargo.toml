@@ -1,6 +1,6 @@
 [package]
 name = "devenv"
-version = "1.4.2"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 
@@ -12,6 +12,8 @@ default-run = "devenv"
 [dependencies]
 devenv-eval-cache.workspace = true
 devenv-tasks.workspace = true
+devenv-cache-core.workspace = true
+http-client-tls.workspace = true
 nix-conf-parser.workspace = true
 
 clap.workspace = true
@@ -19,12 +21,12 @@ cli-table.workspace = true
 console.workspace = true
 dialoguer.workspace = true
 dotlock.workspace = true
+fd-lock.workspace = true
 hex.workspace = true
 include_dir.workspace = true
 indoc.workspace = true
 miette.workspace = true
 nix.workspace = true
-petgraph.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 schemars.workspace = true
@@ -34,9 +36,7 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
-tempdir.workspace = true
 tempfile.workspace = true
-thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-core.workspace = true
@@ -44,8 +44,5 @@ tracing-subscriber.workspace = true
 which.workspace = true
 whoami.workspace = true
 xdg.workspace = true
-tokio-tar.workspace = true
-tokio-util.workspace = true
 similar.workspace = true
-binaryornot.workspace = true
 once_cell.workspace = true

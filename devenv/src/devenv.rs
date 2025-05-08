@@ -1,23 +1,24 @@
-use super::{cli, cnix, config, tasks};
+use super::{cli, cnix, config, tasks, util};
 use clap::crate_version;
 use cli_table::Table;
 use cli_table::{print_stderr, WithTitle};
 use include_dir::{include_dir, Dir};
-use miette::{bail, IntoDiagnostic, Result};
+use miette::{bail, Context, IntoDiagnostic, Result};
 use nix::sys::signal;
 use nix::unistd::Pid;
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use sha2::Digest;
 use similar::{ChangeTag, TextDiff};
-use std::collections::HashMap;
-use std::io::Write;
+use std::collections::{BTreeMap, HashMap};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::{fs::PermissionsExt, process::CommandExt};
 use std::{
-    fs,
+    fs::{self, File},
     path::{Path, PathBuf},
+    process,
 };
-use tracing::{debug, error, info, info_span, warn, Instrument};
+use tracing::{debug, error, info, info_span, instrument, trace, warn, Instrument};
 
 // templates
 const FLAKE_TMPL: &str = include_str!("flake.tmpl.nix");
@@ -25,7 +26,7 @@ const REQUIRED_FILES: [&str; 4] = ["devenv.nix", "devenv.yaml", ".envrc", ".giti
 const EXISTING_REQUIRED_FILES: [&str; 1] = [".gitignore"];
 const PROJECT_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/init");
 pub static DIRENVRC: Lazy<String> = Lazy::new(|| {
-    include_str!("../../direnvrc").replace(
+    include_str!("../direnvrc").replace(
         "DEVENV_DIRENVRC_ROLLING_UPGRADE=0",
         "DEVENV_DIRENVRC_ROLLING_UPGRADE=1",
     )
@@ -34,19 +35,31 @@ pub static DIRENVRC_VERSION: Lazy<u8> = Lazy::new(|| {
     DIRENVRC
         .lines()
         .find(|line| line.contains("export DEVENV_DIRENVRC_VERSION"))
-        .map(|line| line.split('=').last().unwrap().trim())
+        .and_then(|line| line.split('=').next_back())
+        .map(|version| version.trim())
         .and_then(|version| version.parse().ok())
         .unwrap_or(0)
 });
 // project vars
 const DEVENV_FLAKE: &str = ".devenv.flake.nix";
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct DevenvOptions {
     pub config: config::Config,
     pub global_options: Option<cli::GlobalOptions>,
     pub devenv_root: Option<PathBuf>,
     pub devenv_dotfile: Option<PathBuf>,
+}
+
+#[derive(Default, Debug)]
+pub struct ProcessOptions<'a> {
+    /// An optional environment map to pass to the process.
+    /// If not provided, the process will be executed inside a freshly evaluated shell.
+    pub envs: Option<&'a HashMap<String, String>>,
+    /// Whether the process should be detached from the current process.
+    pub detach: bool,
+    /// Whether the process should be logged to a file.
+    pub log_to_file: bool,
 }
 
 pub struct Devenv {
@@ -159,7 +172,7 @@ impl Devenv {
 
             let path = PROJECT_DIR
                 .get_file(filename)
-                .unwrap_or_else(|| panic!("missing {} in the executable", filename));
+                .ok_or_else(|| miette::miette!("missing {} in the executable", filename))?;
 
             // write path.contents to target/filename
             let target_path = target.join(filename);
@@ -199,8 +212,8 @@ impl Devenv {
     }
 
     pub fn inputs_add(&mut self, name: &str, url: &str, follows: &[String]) -> Result<()> {
-        self.config.add_input(name, url, follows);
-        self.config.write();
+        self.config.add_input(name, url, follows)?;
+        self.config.write()?;
         Ok(())
     }
 
@@ -213,72 +226,142 @@ impl Devenv {
         Ok(())
     }
 
-    pub async fn shell(
-        &mut self,
-        cmd: &Option<String>,
-        args: &[String],
-        replace_shell: bool,
-    ) -> Result<()> {
-        let develop_args = self.prepare_develop_args(cmd, args).await?;
-
-        let develop_args = develop_args
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<&str>>();
-
-        let span = info_span!("Entering shell", devenv.user_message = "Entering shell");
-        self.nix
-            .develop(&develop_args, replace_shell)
-            .instrument(span)
-            .await?;
-        Ok(())
+    // TODO: fetch bash from the module system
+    async fn get_bash(&mut self, refresh_cached_output: bool) -> Result<String> {
+        let options = cnix::Options {
+            cache_output: true,
+            refresh_cached_output,
+            ..self.nix.options
+        };
+        let bash_attr = format!(
+            "nixpkgs#legacyPackages.{}.bashInteractive.out",
+            self.global_options.system
+        );
+        String::from_utf8(
+            self.nix
+                .run_nix(
+                    "nix",
+                    &[
+                        "build",
+                        "--inputs-from",
+                        ".",
+                        "--print-out-paths",
+                        "--out-link",
+                        &self.devenv_dotfile.join("bash").to_string_lossy(),
+                        &bash_attr,
+                    ],
+                    &options,
+                )
+                .await?
+                .stdout,
+        )
+        .map(|mut s| {
+            let trimmed_len = s.trim_end_matches('\n').len();
+            s.truncate(trimmed_len);
+            s.push_str("/bin/bash");
+            s
+        })
+        .into_diagnostic()
     }
 
-    pub async fn prepare_develop_args(
+    #[instrument(skip(self))]
+    pub async fn prepare_shell(
         &mut self,
         cmd: &Option<String>,
         args: &[String],
-    ) -> Result<Vec<String>> {
-        self.assemble(false).await?;
-        let env = self.get_dev_environment(false).await?;
+    ) -> Result<std::process::Command> {
+        let DevEnv { mut output, .. } = self.get_dev_environment(false).await?;
 
-        let mut develop_args = vec![
-            "develop",
-            env.gc_root.to_str().expect("gc root should be utf-8"),
-        ];
-
-        let default_clean = config::Clean {
-            enabled: false,
-            keep: vec![],
+        let bash = match self.get_bash(false).await {
+            Err(e) => {
+                trace!("Failed to get bash: {}. Rebuilding.", e);
+                self.get_bash(true).await?
+            }
+            Ok(bash) => bash,
         };
-        let config_clean = self.config.clean.as_ref().unwrap_or(&default_clean);
-        if self.global_options.clean.is_some() || config_clean.enabled {
-            develop_args.push("--ignore-environment");
 
+        let mut shell_cmd = std::process::Command::new(&bash);
+        let path = self.devenv_runtime.join("shell");
+
+        match cmd {
+            // Non-interactive mode.
+            // exec the command at the end of the rcscript.
+            Some(cmd) => {
+                let command = format!(
+                    "\nexec {} {}",
+                    cmd,
+                    args.iter()
+                        .map(|arg| shell_escape(arg))
+                        .collect::<Vec<String>>()
+                        .join(" ")
+                );
+                output.extend_from_slice(command.as_bytes());
+                shell_cmd.arg(&path);
+            }
+            // Interactive mode. Use an rcfile.
+            None => {
+                shell_cmd.args(["--rcfile", &path.to_string_lossy()]);
+            }
+        }
+
+        tokio::fs::write(&path, &output)
+            .await
+            .expect("Failed to write the shell script");
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .await
+            .expect("Failed to set permissions");
+
+        let config_clean = self.config.clean.clone().unwrap_or_default();
+        if self.global_options.clean.is_some() || config_clean.enabled {
             let keep = match &self.global_options.clean {
                 Some(clean) => clean,
                 None => &config_clean.keep,
             };
 
-            for env in keep {
-                develop_args.push("--keep");
-                develop_args.push(env);
-            }
+            let filtered_env = std::env::vars().filter(|(k, _)| keep.contains(k));
 
-            develop_args.push("-c");
-            develop_args.push("bash");
-            develop_args.push("--norc");
-            develop_args.push("--noprofile")
+            shell_cmd
+                .env_clear()
+                .envs(filtered_env)
+                .arg("--norc")
+                .arg("--noprofile");
         }
 
-        if let Some(cmd) = cmd {
-            develop_args.push("-c");
-            develop_args.push(cmd);
-            let args = args.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
-            develop_args.extend_from_slice(&args);
+        shell_cmd.env("SHELL", &bash);
+
+        // Set DEVENV_TASKS_QUIET if quiet mode is enabled in global options
+        if self.global_options.quiet {
+            shell_cmd.env("DEVENV_TASKS_QUIET", "true");
         }
 
-        Ok(develop_args.into_iter().map(|s| s.to_string()).collect())
+        Ok(shell_cmd)
+    }
+
+    pub async fn shell(mut self) -> Result<()> {
+        let mut shell_cmd = self.prepare_shell(&None, &[]).await?;
+        let span = info_span!("entering_shell", devenv.user_message = "Entering shell",);
+        let _ = shell_cmd.exec().instrument(span);
+        Ok(())
+    }
+
+    pub async fn exec_in_shell(
+        &mut self,
+        cmd: String,
+        args: &[String],
+    ) -> Result<std::process::Output> {
+        let mut shell_cmd = self.prepare_shell(&Some(cmd), args).await?;
+        let span = info_span!(
+            "executing_in_shell",
+            devenv.user_message = "Executing in shell"
+        );
+        span.in_scope(|| {
+            shell_cmd
+                .stdin(std::process::Stdio::inherit())
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit())
+                .output()
+                .into_diagnostic()
+        })
     }
 
     pub async fn update(&mut self, input_name: &Option<String>) -> Result<()> {
@@ -297,7 +380,9 @@ impl Devenv {
 
     pub async fn container_build(&mut self, name: &str) -> Result<String> {
         if cfg!(target_os = "macos") {
-            bail!("Containers are not supported on macOS yet: https://github.com/cachix/devenv/issues/430");
+            bail!(
+                "Containers are not supported on macOS yet: https://github.com/cachix/devenv/issues/430"
+            );
         }
 
         let span = info_span!(
@@ -439,7 +524,9 @@ impl Devenv {
                 devenv.user_message =
                     "Running garbage collection (this process will take some time)"
             );
-            info!("If you'd like this to run faster, leave a thumbs up at https://github.com/NixOS/nix/issues/7239");
+            info!(
+                "If you'd like this to run faster, leave a thumbs up at https://github.com/NixOS/nix/issues/7239"
+            );
             span.in_scope(|| self.nix.gc(to_gc))?;
         }
 
@@ -514,7 +601,9 @@ impl Devenv {
             print_stderr(options_results.with_title()).expect("Failed to print options results");
         }
 
-        info!("Found {search_results_count} packages and {results_options_count} options for '{name}'.");
+        info!(
+            "Found {search_results_count} packages and {results_options_count} options for '{name}'."
+        );
         Ok(())
     }
 
@@ -526,7 +615,11 @@ impl Devenv {
         Ok(self.has_processes.unwrap())
     }
 
-    pub async fn tasks_run(&mut self, roots: Vec<String>) -> Result<()> {
+    pub async fn tasks_run(
+        &mut self,
+        roots: Vec<String>,
+        run_mode: devenv_tasks::RunMode,
+    ) -> Result<()> {
         self.assemble(false).await?;
         if roots.is_empty() {
             bail!("No tasks specified.");
@@ -545,12 +638,18 @@ impl Devenv {
         let tasks: Vec<tasks::TaskConfig> =
             serde_json::from_str(&tasks_json).expect("Failed to parse tasks config");
         // run tasks
-        let config = tasks::Config { roots, tasks };
+        let config = tasks::Config {
+            roots,
+            tasks,
+            run_mode,
+        };
         debug!(
             "Tasks config: {}",
             serde_json::to_string_pretty(&config).unwrap()
         );
-        let mut tui = tasks::TasksUi::new(config).await?;
+
+        // Pass quiet flag from global options to TasksUi (which will set the env var internally)
+        let mut tui = tasks::TasksUi::new(config, self.global_options.quiet).await?;
         let (tasks_status, outputs) = tui.run().await?;
 
         if tasks_status.failed > 0 || tasks_status.dependency_failed > 0 {
@@ -575,26 +674,106 @@ impl Devenv {
                 .instrument(span)
                 .await?
         };
-        let test_script = test_script[0].to_string_lossy().to_string();
+        let test_script_path = &test_script[0];
+
+        // Add GC root for test script to prevent garbage collection
+        self.nix.add_gc("test", test_script_path).await?;
+
+        let test_script = test_script_path.to_string_lossy().to_string();
+
+        let temp_dir = tempfile::TempDir::with_prefix("devenv-test")
+            .into_diagnostic()
+            .wrap_err("Failed to create temporary directory for test")?;
+
+        let script_path = temp_dir.path().join("script");
+        let env_path = temp_dir.path().join("env");
+
+        let script = format!("env > {}", env_path.to_string_lossy());
+        fs::write(&script_path, script)
+            .into_diagnostic()
+            .wrap_err(format!(
+                "Failed to write script to {}",
+                script_path.display()
+            ))?;
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+            .into_diagnostic()
+            .wrap_err(format!(
+                "Failed to set execute permissions on {}",
+                script_path.display()
+            ))?;
+
+        // Run script and capture its environment exports
+        self.prepare_shell(&Some(script_path.to_string_lossy().into()), &[])
+            .await?
+            .stderr(process::Stdio::inherit())
+            .stdout(process::Stdio::inherit())
+            .spawn()
+            .into_diagnostic()
+            .wrap_err("Failed to execute environment capture script")?
+            .wait()
+            .into_diagnostic()
+            .wrap_err("Failed to wait for environment capture script to complete")?;
+
+        // Parse the environment variables
+        let file = File::open(&env_path).into_diagnostic().wrap_err(format!(
+            "Failed to open environment file at {}",
+            env_path.display()
+        ))?;
+        let reader = BufReader::new(file);
+        let shell_envs = reader
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|line| {
+                let mut parts = line.splitn(2, '=');
+                match (parts.next(), parts.next()) {
+                    (Some(key), Some(value)) => Some((key.to_string(), value.to_string())),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let config_clean = self.config.clean.clone().unwrap_or_default();
+        let mut envs: HashMap<String, String> = {
+            let vars = std::env::vars();
+            if self.global_options.clean.is_some() || config_clean.enabled {
+                let keep = match &self.global_options.clean {
+                    Some(clean) => clean,
+                    None => &config_clean.keep,
+                };
+                vars.filter(|(key, _)| !keep.contains(key)).collect()
+            } else {
+                vars.collect()
+            }
+        };
+
+        for (key, value) in shell_envs {
+            envs.insert(key, value);
+        }
 
         if self.has_processes().await? {
-            self.up(None, &true, &false).await?;
+            let options = ProcessOptions {
+                envs: Some(&envs),
+                detach: true,
+                log_to_file: false,
+            };
+            self.up(vec![], &options).await?;
         }
 
         let span = info_span!("test", devenv.user_message = "Running tests");
         let result = async {
             debug!("Running command: {test_script}");
-            let develop_args = self.prepare_develop_args(&Some(test_script), &[]).await?;
-            // TODO: replace_shell?
-            self.nix
-                .develop(
-                    &develop_args
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<&str>>(),
-                    false, // replace_shell
-                )
-                .await
+            process::Command::new(&test_script)
+                .env_clear()
+                .envs(envs)
+                .spawn()
+                .into_diagnostic()
+                .wrap_err(format!(
+                    "Failed to spawn test process using {}",
+                    test_script
+                ))?
+                .wait_with_output()
+                .into_diagnostic()
+                .wrap_err("Failed to get output from test process")
         }
         .instrument(span)
         .await?;
@@ -620,52 +799,58 @@ impl Devenv {
     }
 
     pub async fn build(&mut self, attributes: &[String]) -> Result<()> {
-        self.assemble(false).await?;
-        let attributes: Vec<String> = if attributes.is_empty() {
-            // construct dotted names of all attributes that we need to build
-            let build_output = self.nix.eval(&["build"]).await?;
-            serde_json::from_str::<serde_json::Value>(&build_output)
-                .map_err(|e| miette::miette!("Failed to parse build output: {}", e))?
-                .as_object()
-                .ok_or_else(|| miette::miette!("Build output is not an object"))?
-                .iter()
-                .flat_map(|(key, value)| {
-                    fn flatten_object(prefix: &str, value: &serde_json::Value) -> Vec<String> {
-                        match value {
-                            serde_json::Value::Object(obj) => obj
-                                .iter()
-                                .flat_map(|(k, v)| flatten_object(&format!("{}.{}", prefix, k), v))
-                                .collect(),
-                            _ => vec![format!("devenv.{}", prefix)],
+        let span = info_span!("build", devenv.user_message = "Building");
+        async move {
+            self.assemble(false).await?;
+            let attributes: Vec<String> = if attributes.is_empty() {
+                // construct dotted names of all attributes that we need to build
+                let build_output = self.nix.eval(&["build"]).await?;
+                serde_json::from_str::<serde_json::Value>(&build_output)
+                    .map_err(|e| miette::miette!("Failed to parse build output: {}", e))?
+                    .as_object()
+                    .ok_or_else(|| miette::miette!("Build output is not an object"))?
+                    .iter()
+                    .flat_map(|(key, value)| {
+                        fn flatten_object(prefix: &str, value: &serde_json::Value) -> Vec<String> {
+                            match value {
+                                serde_json::Value::Object(obj) => obj
+                                    .iter()
+                                    .flat_map(|(k, v)| {
+                                        flatten_object(&format!("{}.{}", prefix, k), v)
+                                    })
+                                    .collect(),
+                                _ => vec![format!("devenv.{}", prefix)],
+                            }
                         }
-                    }
-                    flatten_object(key, value)
-                })
-                .collect()
-        } else {
-            attributes
-                .iter()
-                .map(|attr| format!("devenv.{}", attr))
-                .collect()
-        };
-        let paths = self
-            .nix
-            .build(
-                &attributes.iter().map(AsRef::as_ref).collect::<Vec<&str>>(),
-                None,
-            )
-            .await?;
-        for path in paths {
-            println!("{}", path.display());
+                        flatten_object(key, value)
+                    })
+                    .collect()
+            } else {
+                attributes
+                    .iter()
+                    .map(|attr| format!("devenv.{}", attr))
+                    .collect()
+            };
+            let paths = self
+                .nix
+                .build(
+                    &attributes.iter().map(AsRef::as_ref).collect::<Vec<&str>>(),
+                    None,
+                )
+                .await?;
+            for path in paths {
+                println!("{}", path.display());
+            }
+            Ok(())
         }
-        Ok(())
+        .instrument(span)
+        .await
     }
 
-    pub async fn up(
+    pub async fn up<'a>(
         &mut self,
-        process: Option<&str>,
-        detach: &bool,
-        log_to_file: &bool,
+        processes: Vec<String>,
+        options: &'a ProcessOptions<'a>,
     ) -> Result<()> {
         self.assemble(false).await?;
         if !self.has_processes().await? {
@@ -691,11 +876,11 @@ impl Devenv {
 
         let span = info_span!("up", devenv.user_message = "Starting processes");
         async {
-            let process = process.unwrap_or("");
+            let processes = processes.join("");
 
             let processes_script = self.devenv_dotfile.join("processes");
             // we force disable process compose tui if detach is enabled
-            let tui = if *detach {
+            let tui = if options.detach {
                 "export PC_TUI_ENABLED=0"
             } else {
                 ""
@@ -705,38 +890,31 @@ impl Devenv {
                 indoc::formatdoc! {"
                 #!/usr/bin/env bash
                 {tui}
-                exec {proc_script_string} {process}
+                exec {proc_script_string} {processes}
             "},
             )
             .expect("Failed to write PROCESSES_SCRIPT");
 
-            std::fs::set_permissions(&processes_script, std::fs::Permissions::from_mode(0o755))
+            fs::set_permissions(&processes_script, fs::Permissions::from_mode(0o755))
                 .expect("Failed to set permissions");
 
-            let develop_args = self
-                .prepare_develop_args(&Some(processes_script.to_str().unwrap().to_string()), &[])
-                .await?;
+            let mut cmd = if let Some(envs) = options.envs {
+                let mut cmd = process::Command::new("bash");
+                cmd.arg(processes_script.to_string_lossy().to_string())
+                    .env_clear()
+                    .envs(envs);
+                cmd
+            } else {
+                self.prepare_shell(&Some(processes_script.to_string_lossy().to_string()), &[])
+                    .await?
+            };
 
-            let span = info_span!("Entering shell");
-            let mut cmd = self
-                .nix
-                .prepare_command_with_substituters(
-                    "nix",
-                    &develop_args
-                        .iter()
-                        .map(AsRef::as_ref)
-                        .collect::<Vec<&str>>(),
-                    &self.nix.options,
-                )
-                .instrument(span)
-                .await?;
-
-            if *detach {
-                let log_file = std::fs::File::create(self.processes_log())
-                    .expect("Failed to create PROCESSES_LOG");
-                let process = if !*log_to_file {
-                    cmd.stdout(std::process::Stdio::inherit())
-                        .stderr(std::process::Stdio::inherit())
+            if options.detach {
+                let log_file =
+                    fs::File::create(self.processes_log()).expect("Failed to create PROCESSES_LOG");
+                let process = if !options.log_to_file {
+                    cmd.stdout(process::Stdio::inherit())
+                        .stderr(process::Stdio::inherit())
                         .spawn()
                         .expect("Failed to spawn process")
                 } else {
@@ -746,10 +924,10 @@ impl Devenv {
                         .expect("Failed to spawn process")
                 };
 
-                std::fs::write(self.processes_pid(), process.id().to_string())
+                fs::write(self.processes_pid(), process.id().to_string())
                     .expect("Failed to write PROCESSES_PID");
                 info!("PID is {}", process.id());
-                if *log_to_file {
+                if options.log_to_file {
                     info!("See logs:  $ tail -f {}", self.processes_log().display());
                 }
                 info!("Stop:      $ devenv processes stop");
@@ -769,7 +947,7 @@ impl Devenv {
             bail!("No processes running");
         }
 
-        let pid = std::fs::read_to_string(self.processes_pid())
+        let pid = fs::read_to_string(self.processes_pid())
             .expect("Failed to read PROCESSES_PID")
             .parse::<i32>()
             .expect("Failed to parse PROCESSES_PID");
@@ -785,7 +963,7 @@ impl Devenv {
             }
         }
 
-        std::fs::remove_file(self.processes_pid()).expect("Failed to remove PROCESSES_PID");
+        fs::remove_file(self.processes_pid()).expect("Failed to remove PROCESSES_PID");
         Ok(())
     }
 
@@ -794,7 +972,8 @@ impl Devenv {
             return Ok(());
         }
 
-        if !self.devenv_root.join("devenv.nix").exists() {
+        // Skip devenv.nix existence check if --option is provided
+        if self.global_options.option.is_empty() && !self.devenv_root.join("devenv.nix").exists() {
             bail!(indoc::indoc! {"
             File devenv.nix does not exist. To get started, run:
 
@@ -802,13 +981,14 @@ impl Devenv {
             "});
         }
 
-        fs::create_dir_all(&self.devenv_dot_gc)
-            .unwrap_or_else(|_| panic!("Failed to create {}", self.devenv_dot_gc.display()));
+        fs::create_dir_all(&self.devenv_dot_gc).map_err(|e| {
+            miette::miette!("Failed to create {}: {}", self.devenv_dot_gc.display(), e)
+        })?;
 
         // Initialise any Nix state
         self.nix.assemble().await?;
 
-        let mut flake_inputs = HashMap::new();
+        let mut flake_inputs = BTreeMap::new();
         for (input, attrs) in self.config.inputs.iter() {
             match config::FlakeInput::try_from(attrs) {
                 Ok(flake_input) => {
@@ -820,11 +1000,10 @@ impl Devenv {
                 }
             }
         }
-        fs::write(
+        util::write_file_with_lock(
             self.devenv_dotfile.join("flake.json"),
-            serde_json::to_string(&flake_inputs).unwrap(),
-        )
-        .expect("Failed to write flake.json");
+            &serde_json::to_string(&flake_inputs).unwrap(),
+        )?;
         fs::write(
             self.devenv_dotfile.join("devenv.json"),
             serde_json::to_string(&self.config).unwrap(),
@@ -837,6 +1016,65 @@ impl Devenv {
             self.config.imports.join("\n"),
         )
         .expect("Failed to write imports.txt");
+
+        fs::create_dir_all(&self.devenv_runtime).map_err(|e| {
+            miette::miette!("Failed to create {}: {}", self.devenv_runtime.display(), e)
+        })?;
+
+        // Create cli-options.nix if there are CLI options
+        if !self.global_options.option.is_empty() {
+            let mut cli_options = String::from("{ pkgs, lib, config, ... }: {\n");
+
+            const SUPPORTED_TYPES: &[&str] = &["string", "int", "float", "bool", "path", "pkgs"];
+
+            for chunk in self.global_options.option.chunks_exact(2) {
+                // Parse the path and type from the first value
+                let key_parts: Vec<&str> = chunk[0].split(':').collect();
+                if key_parts.len() < 2 {
+                    miette::bail!("Invalid option format: '{}'. Must include type, e.g. 'languages.rust.version:string'. Supported types: {}",
+                           chunk[0], SUPPORTED_TYPES.join(", "));
+                }
+
+                let path = key_parts[0];
+                let type_name = key_parts[1];
+
+                // Format value based on type
+                let value = match type_name {
+                    "string" => format!("\"{}\"", &chunk[1]),
+                    "int" => chunk[1].clone(),
+                    "float" => chunk[1].clone(),
+                    "bool" => chunk[1].clone(), // true/false will work directly in Nix
+                    "path" => format!("./{}", &chunk[1]), // relative path
+                    "pkgs" => {
+                        // Split by whitespace and format as a Nix list of package references
+                        let items = chunk[1]
+                            .split_whitespace()
+                            .map(|item| format!("pkgs.{}", item))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        format!("[ {} ]", items)
+                    }
+                    _ => miette::bail!(
+                        "Unsupported type: '{}'. Supported types: {}",
+                        type_name,
+                        SUPPORTED_TYPES.join(", ")
+                    ),
+                };
+
+                cli_options.push_str(&format!("  {} = {};\n", path, value));
+            }
+
+            cli_options.push_str("}\n");
+
+            fs::write(self.devenv_dotfile.join("cli-options.nix"), cli_options)
+                .expect("Failed to write cli-options.nix");
+        } else {
+            // Remove the file if it exists but there are no CLI options
+            let cli_options_path = self.devenv_dotfile.join("cli-options.nix");
+            if cli_options_path.exists() {
+                fs::remove_file(&cli_options_path).expect("Failed to remove cli-options.nix");
+            }
+        }
 
         // create flake.devenv.nix
         let vars = indoc::formatdoc!(
@@ -867,23 +1105,18 @@ impl Devenv {
         );
         let flake = FLAKE_TMPL.replace("__DEVENV_VARS__", &vars);
         let flake_path = self.devenv_root.join(DEVENV_FLAKE);
-
-        // Avoid writing the flake if it hasn't changed.
-        // direnv's watch_file triggers a reload based solely on mtime, which becomes annoying if we constantly touch this file.
-        let existing_flake = fs::read_to_string(&flake_path).unwrap_or_default();
-        if flake != existing_flake {
-            fs::write(flake_path, flake).expect("Failed to write flake.nix");
-        }
+        util::write_file_with_lock(&flake_path, &flake)?;
 
         self.assembled = true;
         Ok(())
     }
 
+    #[instrument(skip_all,fields(devenv.user_message = "Building shell"))]
     pub async fn get_dev_environment(&mut self, json: bool) -> Result<DevEnv> {
         self.assemble(false).await?;
 
         let gc_root = self.devenv_dot_gc.join("shell");
-        let span = tracing::info_span!("building_shell", devenv.user_message = "Building shell",);
+        let span = tracing::debug_span!("evaluating_dev_env");
         let env = self.nix.dev_env(json, &gc_root).instrument(span).await?;
 
         use devenv_eval_cache::command::{FileInputDesc, Input};
@@ -893,6 +1126,12 @@ impl Devenv {
                 .iter()
                 .filter_map(|input| match input {
                     Input::File(FileInputDesc { path, .. }) => {
+                        // We include --option in the eval cache, but we don't want it
+                        // to trigger direnv reload on each invocation
+                        let cli_options_path = self.devenv_dotfile.join("cli-options.nix");
+                        if path == &cli_options_path {
+                            return None;
+                        }
                         Some(path.to_string_lossy().to_string())
                     }
                     // TODO(sander): update direnvrc to handle env vars if possible
@@ -903,10 +1142,7 @@ impl Devenv {
         )
         .expect("Failed to write input-paths.txt");
 
-        Ok(DevEnv {
-            output: env.stdout,
-            gc_root,
-        })
+        Ok(DevEnv { output: env.stdout })
     }
 }
 
@@ -917,14 +1153,14 @@ fn confirm_overwrite(file: &Path, contents: String) -> Result<()> {
 
         let diff = TextDiff::from_lines(&before, &contents);
 
-        println!("\nChanges that will be made to {}:", file.to_string_lossy());
+        eprintln!("\nChanges that will be made to {}:", file.to_string_lossy());
         for change in diff.iter_all_changes() {
             let sign = match change.tag() {
                 ChangeTag::Delete => "\x1b[31m-\x1b[0m",
                 ChangeTag::Insert => "\x1b[32m+\x1b[0m",
                 ChangeTag::Equal => " ",
             };
-            print!("{}{}", sign, change);
+            eprint!("{}{}", sign, change);
         }
 
         let confirm = dialoguer::Confirm::new()
@@ -946,11 +1182,10 @@ fn confirm_overwrite(file: &Path, contents: String) -> Result<()> {
 
 pub struct DevEnv {
     output: Vec<u8>,
-    gc_root: PathBuf,
 }
 
 #[derive(Deserialize)]
-struct PackageResults(HashMap<String, PackageResult>);
+struct PackageResults(BTreeMap<String, PackageResult>);
 
 #[derive(Deserialize)]
 struct PackageResult {
@@ -959,7 +1194,7 @@ struct PackageResult {
 }
 
 #[derive(Deserialize)]
-struct OptionResults(HashMap<String, OptionResult>);
+struct OptionResults(BTreeMap<String, OptionResult>);
 
 #[derive(Deserialize)]
 struct OptionResult {
@@ -1013,4 +1248,21 @@ fn cleanup_symlinks(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     }
 
     (to_gc, removed_symlinks)
+}
+
+/// Escapes a string for use in shell commands by surrounding it with single quotes and properly escaping any existing single quotes.
+pub fn shell_escape(s: &str) -> String {
+    let mut r = String::with_capacity(s.len() + 2);
+    r.push('\'');
+
+    for c in s.chars() {
+        if c == '\'' {
+            r.push_str("'\\''")
+        } else {
+            r.push(c);
+        }
+    }
+
+    r.push('\'');
+    r
 }

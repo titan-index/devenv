@@ -4,18 +4,17 @@
 , installShellFiles
 , rustPlatform
 , nix
-, cachix
-, darwin
-, sqlx-cli
+, cachix ? null
 , openssl
+, apple-sdk_11
 , pkg-config
 , glibcLocalesUtf8
 , build_tasks ? false
 }:
 
 rustPlatform.buildRustPackage {
-  pname = "devenv";
-  version = "1.4.2";
+  pname = "devenv${lib.optionalString build_tasks "-tasks"}";
+  version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
   # WARN: building this from src/modules/tasks.nix fails.
   # There is something being prepended to the path, hence the .*.
@@ -26,9 +25,10 @@ rustPlatform.buildRustPackage {
     ".*devenv(/.*)?"
     ".*devenv-generate(/.*)?"
     ".*devenv-eval-cache(/.*)?"
+    ".*devenv-cache-core(/.*)?"
     ".*devenv-run-tests(/.*)?"
     ".*devenv-tasks(/.*)?"
-    "direnvrc"
+    ".*http-client-tls(/.*)?"
     ".*nix-conf-parser(/.*)?"
     ".*xtask(/.*)?"
   ];
@@ -48,20 +48,10 @@ rustPlatform.buildRustPackage {
     installShellFiles
     makeBinaryWrapper
     pkg-config
-  ] ++ lib.optional (!build_tasks) sqlx-cli;
+  ];
 
   buildInputs = [ openssl ]
-    ++ lib.optional stdenv.isDarwin darwin.apple_sdk.frameworks.SystemConfiguration;
-
-  # Force sqlx to use the prepared queries
-  SQLX_OFFLINE = true;
-  # A local database to use for preparing queries
-  DATABASE_URL = "sqlite:nix-eval-cache.db";
-
-  preBuild = lib.optionalString (!build_tasks) ''
-    cargo sqlx database setup --source devenv-eval-cache/migrations
-    cargo sqlx prepare --workspace
-  '';
+    ++ lib.optional stdenv.isDarwin apple-sdk_11;
 
   postInstall =
     let
@@ -72,13 +62,13 @@ rustPlatform.buildRustPackage {
     in
     lib.optionalString (!build_tasks) ''
       wrapProgram $out/bin/devenv \
-        --prefix PATH ":" "$out/bin:${cachix}/bin" \
+        --prefix PATH ":" "$out/bin:${lib.getBin cachix}/bin" \
         --set DEVENV_NIX ${nix} \
         ${setDefaultLocaleArchive} \
 
       # TODO: problematic for our library...
       wrapProgram $out/bin/devenv-run-tests \
-        --prefix PATH ":" "$out/bin:${cachix}/bin" \
+        --prefix PATH ":" "$out/bin:${lib.getBin cachix}/bin" \
         --set DEVENV_NIX ${nix} \
         ${setDefaultLocaleArchive} \
 

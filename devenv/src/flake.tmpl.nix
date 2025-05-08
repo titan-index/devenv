@@ -60,8 +60,11 @@
               then devenvdefaultpath
               else throw (devenvdefaultpath + " file does not exist for input ${name}.");
           project = pkgs.lib.evalModules {
-            specialArgs = inputs // { inherit inputs; bootstrapPkgs = pkgs; };
+            specialArgs = inputs // { inherit inputs; };
             modules = [
+              ({ config, ... }: {
+                _module.args.pkgs = pkgs.appendOverlays (config.overlays or [ ]);
+              })
               (inputs.devenv.modules + /top-level.nix)
               {
                 devenv.cliVersion = version;
@@ -85,9 +88,10 @@
                 };
               })
             ] ++ (map importModule (devenv.imports or [ ])) ++ [
-              ./devenv.nix
+              (if builtins.pathExists ./devenv.nix then ./devenv.nix else { })
               (devenv.devenv or { })
               (if builtins.pathExists ./devenv.local.nix then ./devenv.local.nix else { })
+              (if builtins.pathExists (devenv_dotfile + "/cli-options.nix") then import (devenv_dotfile + "/cli-options.nix") else { })
             ];
           };
           config = project.config;

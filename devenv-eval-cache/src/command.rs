@@ -10,10 +10,11 @@ use thiserror::Error;
 use tracing::{debug, trace};
 
 use crate::{
-    db, hash,
+    db,
     internal_log::{InternalLog, Verbosity},
     op::Op,
 };
+use devenv_cache_core::{compute_file_hash, compute_string_hash};
 
 #[derive(Error, Diagnostic, Debug)]
 pub enum CommandError {
@@ -45,6 +46,10 @@ impl<'a> CachedCommand<'a> {
     }
 
     /// Watch additional paths for changes.
+    ///
+    /// WARN: Be careful watching generated files.
+    /// External tools like direnv are triggered solely by the modification date and don't compare file contents.
+    /// Use [util::write_file_with_lock] to safely write such files.
     pub fn watch_path<P: AsRef<Path>>(&mut self, path: P) -> &mut Self {
         self.extra_paths.push(path.as_ref().to_path_buf());
         self
@@ -76,11 +81,13 @@ impl<'a> CachedCommand<'a> {
     /// the cached output will be returned.
     pub async fn output(mut self, cmd: &'a mut Command) -> Result<Output, CommandError> {
         let raw_cmd = format!("{:?}", cmd);
-        let cmd_hash = hash::digest(&raw_cmd);
+        let cmd_hash = compute_string_hash(&raw_cmd);
 
         // Check whether the command has been previously run and the files it depends on have not been changed.
         if !self.force_refresh {
-            if let Ok(Some(output)) = query_cached_output(self.pool, &cmd_hash).await {
+            if let Ok(Some(output)) =
+                query_cached_output(self.pool, &cmd_hash, &self.extra_paths).await
+            {
                 return Ok(output);
             }
         }
@@ -118,7 +125,7 @@ impl<'a> CachedCommand<'a> {
             let mut lines = stderr_reader.lines();
             while let Some(Ok(line)) = lines.next() {
                 if let Some(log) = InternalLog::parse(&line).and_then(Result::ok) {
-                    if let Some(ref f) = &on_stderr {
+                    if let Some(f) = &on_stderr {
                         f(&log);
                     }
 
@@ -185,23 +192,7 @@ impl<'a> CachedCommand<'a> {
         // Watch additional paths
         sources.extend_from_slice(&self.extra_paths);
 
-        let now = SystemTime::now();
-        let file_input_futures = sources
-            .into_iter()
-            .map(|source| {
-                tokio::task::spawn_blocking(move || {
-                    FileInputDesc::new(source, now).map_err(CommandError::Io)
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let file_inputs = join_all(file_input_futures)
-            .await
-            .into_iter()
-            .flatten()
-            // TODO: add tracing here
-            .filter_map(Result::ok)
-            .collect::<Vec<_>>();
+        let file_inputs = query_file_inputs(&sources).await;
 
         let mut inputs = file_inputs
             .into_iter()
@@ -210,7 +201,7 @@ impl<'a> CachedCommand<'a> {
             .collect::<Vec<_>>();
 
         inputs.sort();
-        inputs.dedup();
+        inputs.dedup_by(Input::dedup);
 
         let input_hash = Input::compute_input_hash(&inputs);
 
@@ -269,10 +260,12 @@ impl Input {
     }
 
     pub fn compute_input_hash(inputs: &[Self]) -> String {
-        inputs
-            .iter()
-            .filter_map(Input::content_hash)
-            .collect::<String>()
+        compute_string_hash(
+            &inputs
+                .iter()
+                .filter_map(Input::content_hash)
+                .collect::<String>(),
+        )
     }
 
     pub fn partition_refs(inputs: &[Self]) -> (Vec<&FileInputDesc>, Vec<&EnvInputDesc>) {
@@ -288,6 +281,19 @@ impl Input {
 
         (file_inputs, env_inputs)
     }
+
+    pub fn dedup(a: &mut Self, b: &mut Self) -> bool {
+        match (a, b) {
+            (Input::File(f), Input::File(g)) => {
+                f == g
+                    || f.path == g.path
+                        && f.content_hash == g.content_hash
+                        && f.is_directory == g.is_directory
+            }
+            (Self::Env(f), Self::Env(g)) => f == g,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -299,8 +305,12 @@ pub struct FileInputDesc {
 }
 
 impl Ord for FileInputDesc {
+    /// Sort by path first, then by modified_at in reverse order.
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.path.cmp(&other.path)
+        match self.path.cmp(&other.path) {
+            std::cmp::Ordering::Equal => other.modified_at.cmp(&self.modified_at),
+            otherwise => otherwise,
+        }
     }
 }
 
@@ -314,6 +324,8 @@ impl FileInputDesc {
     // A fallback system time is required for paths that don't exist.
     // This avoids duplicate entries for paths that don't exist and would only differ in terms of
     // the timestamp of when this function was called.
+    //
+    // All timestamps are truncated to second precision.
     pub fn new(path: PathBuf, fallback_system_time: SystemTime) -> Result<Self, io::Error> {
         let is_directory = path.is_dir();
         let content_hash = if is_directory {
@@ -321,14 +333,22 @@ impl FileInputDesc {
                 .filter_map(Result::ok)
                 .map(|entry| entry.path().to_string_lossy().to_string())
                 .collect::<String>();
-            Some(hash::digest(&paths))
+            Some(compute_string_hash(&paths))
         } else {
-            hash::compute_file_hash(&path).ok()
+            compute_file_hash(&path)
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to compute file hash: {}", e),
+                    )
+                })
+                .ok()
         };
-        let modified_at = path
-            .metadata()
-            .and_then(|p| p.modified())
-            .unwrap_or(fallback_system_time);
+        let modified_at = truncate_to_seconds(
+            path.metadata()
+                .and_then(|p| p.modified())
+                .unwrap_or(fallback_system_time),
+        )?;
         Ok(Self {
             path,
             is_directory,
@@ -359,7 +379,7 @@ impl PartialOrd for EnvInputDesc {
 impl EnvInputDesc {
     pub fn new(name: String) -> Result<Self, io::Error> {
         let value = std::env::var(&name).ok();
-        let content_hash = value.map(hash::digest);
+        let content_hash = value.map(|v| compute_string_hash(&v));
         Ok(Self { name, content_hash })
     }
 }
@@ -411,6 +431,7 @@ impl From<db::EnvInputRow> for EnvInputDesc {
 async fn query_cached_output(
     pool: &SqlitePool,
     cmd_hash: &str,
+    extra_paths: &[PathBuf],
 ) -> Result<Option<Output>, CommandError> {
     let cached_cmd = db::get_command_by_hash(pool, cmd_hash)
         .await
@@ -435,8 +456,16 @@ async fn query_cached_output(
             .chain(envs.into_iter().map(Input::from))
             .collect::<Vec<_>>();
 
+        let extra_file_inputs = query_file_inputs(extra_paths)
+            .await
+            .into_iter()
+            .map(Input::File)
+            .collect::<Vec<_>>();
+
+        inputs.extend(extra_file_inputs);
+
         inputs.sort();
-        inputs.dedup();
+        inputs.dedup_by(Input::dedup);
 
         let mut should_refresh = false;
 
@@ -447,8 +476,10 @@ async fn query_cached_output(
             debug!(
                 old_hash = cmd.input_hash,
                 new_hash = new_input_hash,
-                "Input hashes do not match, refreshing command",
+                "Input hashes don't match. The inputs have been modified since the command was cached. Refreshing command."
             );
+            trace!(inputs = ?inputs, "Inputs");
+
             should_refresh = true;
         }
 
@@ -479,6 +510,7 @@ async fn query_cached_output(
                             if let Input::File(file) = &inputs[index] {
                                 trace!(
                                     input = ?input,
+                                    modified_at = ?modified_at,
                                     "File metadata has been modified, updating modified_at"
                                 );
                                 // TODO: batch with query builder?
@@ -487,14 +519,19 @@ async fn query_cached_output(
                                     .map_err(CommandError::Sqlx)?;
                             }
                         }
-                        FileState::Modified { .. } => {
+                        FileState::Modified {
+                            new_hash,
+                            modified_at,
+                        } => {
                             trace!(
                                 input = ?input,
+                                new_hash,
+                                modified_at = ?modified_at,
                                 "Input has been modified, refreshing command"
                             );
                             should_refresh = true;
                         }
-                        FileState::Removed { .. } => {
+                        FileState::Removed => {
                             trace!(
                                 input = ?input,
                                 "Input has been removed, refreshing command"
@@ -529,6 +566,26 @@ async fn query_cached_output(
         trace!(command_hash = cmd_hash, "Command not found in cache");
         Ok(None)
     }
+}
+
+async fn query_file_inputs(sources: &[PathBuf]) -> Vec<FileInputDesc> {
+    let now = SystemTime::now();
+    let file_input_futures = sources
+        .iter()
+        .cloned()
+        .map(|source| {
+            tokio::task::spawn_blocking(move || {
+                FileInputDesc::new(source, now).map_err(CommandError::Io)
+            })
+        })
+        .collect::<futures::stream::FuturesUnordered<_>>();
+
+    join_all(file_input_futures)
+        .await
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>()
 }
 
 /// Convert a parse log line into into an `Op`.
@@ -598,9 +655,14 @@ fn check_file_state(file: &FileInputDesc) -> io::Result<FileState> {
             .filter_map(Result::ok)
             .map(|entry| entry.path().to_string_lossy().to_string())
             .collect::<String>();
-        hash::digest(&paths)
+        compute_string_hash(&paths)
     } else {
-        hash::compute_file_hash(&file.path)?
+        compute_file_hash(&file.path).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to compute file hash: {}", e),
+            )
+        })?
     };
 
     if Some(&new_hash) == file.content_hash.as_ref() {
@@ -626,12 +688,12 @@ fn check_env_state(env: &EnvInputDesc) -> io::Result<FileState> {
         }
     }
 
-    let new_hash = hash::digest(value.unwrap_or("".into()));
+    let new_hash = compute_string_hash(&value.unwrap_or("".into()));
 
     if Some(&new_hash) != env.content_hash.as_ref() {
         Ok(FileState::Modified {
             new_hash,
-            modified_at: SystemTime::now(),
+            modified_at: truncate_to_seconds(SystemTime::now())?,
         })
     } else {
         Ok(FileState::Unchanged)
@@ -641,8 +703,7 @@ fn check_env_state(env: &EnvInputDesc) -> io::Result<FileState> {
 fn truncate_to_seconds(time: SystemTime) -> io::Result<SystemTime> {
     let duration_since_epoch = time
         .duration_since(UNIX_EPOCH)
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "SystemTime before UNIX EPOCH"))?;
-
+        .map_err(|_| io::Error::other("SystemTime before UNIX EPOCH"))?;
     let seconds = duration_since_epoch.as_secs();
     Ok(UNIX_EPOCH + std::time::Duration::from_secs(seconds))
 }
@@ -652,7 +713,7 @@ mod test {
     use super::*;
     use std::fs::File;
     use std::io::Write;
-    use tempdir::TempDir;
+    use tempfile::TempDir;
 
     fn create_file_row(dir: &TempDir, content: &[u8]) -> db::FileInputRow {
         let file_path = dir.path().join("test_file.txt");
@@ -662,7 +723,14 @@ mod test {
         let metadata = file_path.metadata().unwrap();
         let modified_at = metadata.modified().unwrap();
         let truncated_modified_at = truncate_to_seconds(modified_at).unwrap();
-        let content_hash = hash::compute_file_hash(&file_path).unwrap();
+        let content_hash = compute_file_hash(&file_path)
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to compute file hash: {}", e),
+                )
+            })
+            .unwrap();
 
         db::FileInputRow {
             path: file_path,
@@ -675,7 +743,7 @@ mod test {
 
     #[test]
     fn test_unchanged_file() {
-        let temp_dir = TempDir::new("test_unchanged_file").unwrap();
+        let temp_dir = TempDir::with_prefix("test_unchanged_file").unwrap();
         let file_row = create_file_row(&temp_dir, b"Hello, World!");
 
         assert!(matches!(
@@ -686,7 +754,7 @@ mod test {
 
     #[test]
     fn test_metadata_modified_file() {
-        let temp_dir = TempDir::new("test_metadata_modified_file").unwrap();
+        let temp_dir = TempDir::with_prefix("test_metadata_modified_file").unwrap();
         let file_row = create_file_row(&temp_dir, b"Hello, World!");
 
         // Sleep to ensure the new modification time is different
@@ -706,7 +774,7 @@ mod test {
 
     #[test]
     fn test_content_modified_file() {
-        let temp_dir = TempDir::new("test_content_modified_file").unwrap();
+        let temp_dir = TempDir::with_prefix("test_content_modified_file").unwrap();
         let file_row = create_file_row(&temp_dir, b"Hello, World!");
 
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -723,7 +791,7 @@ mod test {
 
     #[test]
     fn test_removed_file() {
-        let temp_dir = TempDir::new("test_removed_file").unwrap();
+        let temp_dir = TempDir::with_prefix("test_removed_file").unwrap();
         let file_row = create_file_row(&temp_dir, b"Hello, World!");
 
         // Remove the file
@@ -731,7 +799,43 @@ mod test {
 
         assert!(matches!(
             check_file_state(&file_row.into()),
-            Ok(FileState::Removed { .. })
+            Ok(FileState::Removed)
         ));
+    }
+
+    #[test]
+    fn test_input_dedup_by() {
+        let path = PathBuf::from("test.txt");
+        let content_hash = Some("abc123".to_string());
+        let file1 = Input::File(FileInputDesc {
+            path: path.clone(),
+            is_directory: false,
+            content_hash: content_hash.clone(),
+            modified_at: UNIX_EPOCH,
+        });
+        let file2 = Input::File(FileInputDesc {
+            path: path.clone(),
+            is_directory: false,
+            content_hash: content_hash.clone(),
+            modified_at: UNIX_EPOCH + std::time::Duration::from_secs(1),
+        });
+
+        let mut inputs = vec![file1, file2.clone()];
+        inputs.sort();
+        inputs.dedup_by(Input::dedup);
+        assert!(inputs.len() == 1);
+        assert_eq!(inputs[0], file2);
+    }
+
+    #[test]
+    fn test_truncate_system_time_to_seconds() {
+        let time = SystemTime::now();
+        let truncated_time = truncate_to_seconds(time).unwrap();
+        let duration_since_epoch = truncated_time
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .subsec_millis();
+        // Test that the last 3 digits are zeros
+        assert_eq!(duration_since_epoch % 1_000, 0);
     }
 }
